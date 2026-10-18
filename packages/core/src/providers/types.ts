@@ -308,6 +308,8 @@ export interface WatchTarget {
   readonly path: string;
   /** Exact descendant basenames that the app should forward from this tree, beyond JSON transcripts. */
   readonly fileNames?: readonly string[];
+  /** Optional predicate matching descendant basenames beyond exact fileNames. */
+  readonly matches?: (filename: string) => boolean;
 }
 
 /** Complete adapter interface used by every indexing and presentation caller. */

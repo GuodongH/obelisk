@@ -27,6 +27,7 @@ import type { SqliteDb } from './sqlite-types.ts';
 import { nodeSqliteTransactionAdapter } from './tx.ts';
 import { runRetryableWriteTransaction } from './write-coordinator.ts';
 import { openHermesStoreWithNodeSqlite } from './providers/hermes-node.ts';
+import { openOpencodeDatabaseWithNodeSqlite } from './providers/opencode-node.ts';
 
 export { buildIndex, DB_PATH };
 
@@ -74,6 +75,7 @@ function refreshQueryIndex(): ProviderRegistry {
   const providerRegistry = createConfiguredBuiltinProviderRuntime(settings.settings, {
     openCopilotChronicle: openCopilotChronicleWithNodeSqlite,
     openHermesStore: openHermesStoreWithNodeSqlite,
+    openOpencodeDatabase: openOpencodeDatabaseWithNodeSqlite,
   }).registry;
   if (!settings.ok) {
     const schema = ensureReadableSchema();

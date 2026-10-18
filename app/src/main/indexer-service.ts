@@ -102,7 +102,11 @@ function isDeclaredTreeFile(targetPath: string, targets: readonly WatchTarget[])
   const normalized = path.normalize(targetPath);
   const basename = path.basename(normalized);
   return targets.some(target => {
-    if (target.kind !== 'tree' || !target.fileNames?.includes(basename)) return false;
+    if (target.kind !== 'tree') return false;
+    const matches = typeof target.matches === 'function'
+      ? target.matches(basename)
+      : (target.fileNames ? target.fileNames.includes(basename) : false);
+    if (!matches) return false;
     const relative = path.relative(path.normalize(target.path), normalized);
     return relative.length > 0 && !path.isAbsolute(relative)
       && relative !== '..' && !relative.startsWith(`..${path.sep}`);

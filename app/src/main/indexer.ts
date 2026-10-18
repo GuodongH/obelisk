@@ -335,18 +335,24 @@ function buildIndex({
       const openKiroDatabase = (sourcePath: string) => new (
         DatabaseImpl as new (path: string, options?: { readonly?: boolean; fileMustExist?: boolean; timeout?: number }) => any
       )(sourcePath, { readonly: true, fileMustExist: true, timeout: 500 });
+      const openOpencodeDatabase = (sourcePath: string) => new (
+        DatabaseImpl as new (path: string, options?: { readonly?: boolean; fileMustExist?: boolean; timeout?: number }) => any
+      )(sourcePath, { readonly: true, fileMustExist: true, timeout: 500 });
       const registry = providerRegistry
         ?? (providerSettings === undefined
-          ? createBuiltinProviderRegistry(roots, { openCopilotChronicle, openHermesStore, openZcodeDatabase, openKiroDatabase })
+          ? createBuiltinProviderRegistry(roots, { homeDir: compatibilityHome, openCopilotChronicle, openHermesStore, openZcodeDatabase, openKiroDatabase, openOpencodeDatabase })
           : createConfiguredBuiltinProviderRuntime(providerSettings, {
+            homeDir: compatibilityHome,
             baseRoots: {
               ...roots,
               ...(!hasExplicitProviderRoot(providerSettings, 'copilot') ? { copilot: undefined } : {}),
+              ...(!hasExplicitProviderRoot(providerSettings, 'opencode') ? { opencode: undefined } : {}),
             },
             openCopilotChronicle,
             openHermesStore,
             openZcodeDatabase,
             openKiroDatabase,
+            openOpencodeDatabase,
           }).registry);
       const providerPlan = createProviderIndexPlan(db, registry, {
         force,
