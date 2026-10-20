@@ -122,7 +122,7 @@ four failed for the reported behavior. Centralized the byte-compatible identity
 codec, introduced explicit authenticated tombstone metadata, fixed shared watcher
 union semantics and shared native payload decoding between projection and raw.
 Pre-split completed compaction now projects to summaries; canonical marker is v3.
-Targeted provider/watcher suites: 44 passed; root/apptypecheck: zero errors.
+Targeted provider/watcher suites: 44 passed; root/app typecheck: zero errors.
 
 Two existing assertions necessarily follow the new representation: the tombstone
 now carries its real native ID and an explicit kind (instead of the empty-ID
@@ -162,7 +162,7 @@ the stated O(A + S + C log N + B_changed) model omits sorting constants and appl
 to payload work, not a claim of zero source-page IO or message-level O(delta).
 
 Focused integration: 83 passed (provider, app indexing, service and watcher filter),
-root/apptypecheck: zero errors. Corrected performance regressions were also run
+root/app typecheck: zero errors. Corrected performance regressions were also run
 against commit 27ef497 and failed on actual full payload reads, then passed with
 this implementation. The 10x-unrelated-history case reads 5 affected payload rows
 per modern update, with zero unchanged payload reads, including cold provider
@@ -232,3 +232,50 @@ session, successful canonical history and no fake control session.
 Focused provider/indexer/service/watcher suites: 87 passed; root/app typecheck:
 zero errors. Final full verification and the independent followup reports are
 recorded in the delivery section below.
+
+## Delivery verification
+
+Final reviewed product code: `b65cef4305fef9e31ab3fa3ed4b894dca92ee76d`;
+subsequent delivery changes contain documentation and trailing-blank-line cleanup
+only; runtime logic, app, tests and CI remain unchanged.
+Host macOS arm64, Node 22.23.3; pinned upstream versions/SHAs remain those above.
+
+- `npm test`: **975 passed, 0 failed**; root/app typecheck: **0 errors**;
+  lint: **0 errors, 9 existing warnings**.
+- `npm run test:electron:all`: **7/7 suites**.
+- Fresh independent Standards followup: **113 passed, 0 failed**, no remaining
+  blockers; Spec followup: **123 passed, 0 failed**, no remaining blockers.
+  Both reproduced their original blocker and validated its repair. Standards also
+  independently verified interrupted observation/proof/parent commits and proof
+  transaction failure; all retries converge without losing child relationships.
+- Rebuilt npm CLI tarball: first import, query/raw, tools/reasoning, tokens 19/23,
+  same-ms body-only update, message add/delete, stable rebuild identity, missing
+  source refusing destructive rebuild, unchanged source-main-file SHA256. Both
+  complete official schemas and native shell shapes pass through the packed CLI.
+- Rebuilt unsigned macOS app: actual packaged Electron **43.2.0**, embedded Node
+  **24.18.0**, ABI **148** loads bundled better-sqlite3, indexes both official
+  schemas in the worker, returns six channel DB/WAL hints, and retrieves raw text.
+- Real SQLite busy/rollback/unknown-schema and native watcher checks pass: source
+  updates without session timestamp changes, deletion, new dotted channel, inode
+  replacement and missing-source last-good retention. Closed-source and closed-WAL
+  cold-reader probes retain zero unchanged payload reads.
+- Source workload: 100 legacy sessions / 2,000 or 20,000 parts read **zero payload
+  rows/bytes** on unchanged discovery, instead of 2,100 / 20,100 rows. Metadata cost
+  still grows with retained legacy records. Normal modern updates with 10x
+  unrelated history read exactly five affected payload rows in both workloads.
+- Independent destination-control probe: 100 / 1,000 sessions read the full pending
+  list once and fetched 16,420 / 159,820 control cursor bytes, replacing the earlier
+  quadratic 662,000 / 61,820,000 bytes. Single-run timings are not a latency SLA.
+
+All data is synthetic or the existing sanitized fixture. Windows/Linux packaging,
+network filesystems and later upstream writer versions were not certified. Arbitrary
+SQL edits hidden by another legitimate metadata change within the same unobserved
+interval are outside the attested writer contract. Checkpoint/rotation and unknown
+continuity can intentionally trigger full reconciliation. Raw cursor authentication
+may read the requested session's full payload. Source ownership remains read-only,
+including normal SQLite WAL/shared-memory coordination.
+
+Node 22.13.0 still fails CLI startup at the pre-existing DSH zstd import, reproduced
+on base in the earlier review and again in the final packed CLI; this work verifies
+Node 22.23.3 and does not repair or expand the declared runtime floor. Current main
+was not merged; final verification applies to this PR's code and the recorded base.

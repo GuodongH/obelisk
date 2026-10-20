@@ -1148,4 +1148,3 @@ export function* parseV1(
 
   return fingerprint;
 }
-
