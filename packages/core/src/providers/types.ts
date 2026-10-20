@@ -31,7 +31,7 @@ export type Cursor = string | null;
 export interface IndexUnit {
   /** Stable identity used as the index_state cursor key. */
   key: string;
-  /** Session id this unit indexes into. */
+  /** Session id this unit indexes into; empty for recordless source-control units. */
   sessionId: string;
   /** Project slug (dash-encoded path), when the source exposes one. */
   project?: string;
@@ -42,6 +42,10 @@ export interface IndexUnit {
   meta?: unknown;
   /** Previously indexed sessions atomically retracted by persist before this unit is written. */
   retractSessionIds?: readonly string[];
+  /** Cursor prerequisites checked inside this unit's destination transaction.
+   * Used when source observation/pending work must be durable before replacement.
+   * A prerequisite is observed state, not proof that its dependent units finished. */
+  requiresCursors?: readonly { key: string; cursor: string }[];
 }
 
 /** Read-only source provenance exposed to one provider during discovery. */

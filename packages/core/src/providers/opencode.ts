@@ -24,8 +24,8 @@ import { existsSync, readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, normalize, sep } from 'node:path';
 
-import { encodeCursor, decodeCursor, storePhysicalState } from './opencode-manifest.ts';
-import type { StoreObservation } from './opencode-manifest.ts';
+import { encodeCursor, decodeCursor, encodeStoreCursor, decodeStoreCursor, storePhysicalState, digest } from './opencode-manifest.ts';
+import type { StoreObservation, StoreCursorState, PendingSession } from './opencode-manifest.ts';
 import { RetryableSourceReadError } from './source-read-error.ts';
 import { parseV1, parseV2, fingerprintSession } from './opencode-project.ts';
 import { checkIsSubagent, sourceTables, readSessionEntry, observeSessions, observeSession, transcriptSchema } from './opencode-source.ts';
@@ -33,7 +33,7 @@ import type { SessionMessageRow, MessageRow, PartRow } from './opencode-source.t
 import { isRecord, modernMessageData, legacyMessageData, legacyPartData, str, parseModelRef, completedCompaction } from './opencode-decode.ts';
 export { parseModelRef } from './opencode-decode.ts';
 
-import { decodeOpencodeUnitKey, opencodeSessionId, opencodeUnitKey } from './opencode-identity.ts';
+import { decodeOpencodeUnitKey, opencodeSessionId, opencodeUnitKey, opencodeObservationKey } from './opencode-identity.ts';
 export { opencodeStoreHash, opencodeSessionId, opencodeUnitKey } from './opencode-identity.ts';
 
 import { normalizeObservedCwd, projectSlugFromPath } from '../parsing.ts';
@@ -151,7 +151,7 @@ interface OpencodeSessionMeta {
   dbPath: string;
   rawSessionId: string;
   manifest: string;
-  recovery: number;
+  revision: number;
   store: StoreObservation;
   reason: 'changed-session' | 'source-replaced' | 'unexplained-write' | 'cursor-upgrade';
   reconcileFingerprint?: string;
@@ -163,7 +163,12 @@ interface OpencodeTombstoneMeta {
   dbPath: string;
   rawSessionId: string;
 }
-type OpencodeUnitMeta = OpencodeSessionMeta | OpencodeTombstoneMeta;
+interface OpencodeObservationMeta {
+  kind: 'opencode-observation';
+  dbPath: string;
+  observation: StoreCursorState;
+}
+type OpencodeUnitMeta = OpencodeSessionMeta | OpencodeTombstoneMeta | OpencodeObservationMeta;
 
 function discoverAtStore(
   dbPath: string,
@@ -249,20 +254,19 @@ function discoverAtStore(
 
       const changedRawIds = new Set<string>();
       const states = new Map(sortedSessions.map(({ row }) => [row.id, decodeCursor(ctx.lastCursor(opencodeUnitKey(dbPath, row.id)))]));
-      const priorInStore = indexedSessions.filter(s => decodeOpencodeUnitKey(s.jsonlPath)?.dbPath === normalize(dbPath));
-      const hasKnownChange = sortedSessions.some(entry => {
-        const state = states.get(entry.row.id);
-        return state == null || state.manifest !== entry.manifest
-          || state.store.identity !== store.identity || state.store.schema !== store.schema;
-      }) || priorInStore.some(s => !sessionsMap.has(decodeOpencodeUnitKey(s.jsonlPath)!.nativeId));
-      const stampAcknowledged = [...states.values()].some(state => state?.store.identity === store.identity
-        && state.store.schema === store.schema && state.store.stamp === store.stamp);
-      const unexplainedWrite = !hasKnownChange && !stampAcknowledged;
-      // A reconciliation is complete per unit, never just because one sibling
-      // acknowledged this store stamp. Carry its generation in successful cursors
-      // so failed units remain pending across partial commits and restarts.
-      const recoveryStates = [...states.values(), ...priorInStore.map(s => decodeCursor(ctx.lastCursor(s.jsonlPath)))];
-      const generation = recoveryStates.reduce((max, state) => Math.max(max, state?.recovery ?? 0), 0) + (unexplainedWrite ? 1 : 0);
+      const observationKey = opencodeObservationKey(dbPath);
+      const priorObservation = decodeStoreCursor(ctx.lastCursor(observationKey));
+      const inventory = digest([...sessionsMap].map(([id, e]) => [id, e.manifest]).sort((a, b) => a[0]!.localeCompare(b[0]!)));
+      const observationChanged = priorObservation === null || priorObservation.inventory !== inventory
+        || JSON.stringify(priorObservation.store) !== JSON.stringify(store);
+      const revision = (priorObservation?.revision ?? 0) + (observationChanged ? 1 : 0);
+      const unexplainedWrite = priorObservation !== null && priorObservation.inventory === inventory
+        && priorObservation.store.identity === store.identity && priorObservation.store.schema === store.schema
+        && priorObservation.store.stamp !== store.stamp;
+      const pending = new Map<string, PendingSession>();
+      for (const work of priorObservation?.pending ?? []) {
+        if (sessionsMap.has(work.id) && (states.get(work.id)?.revision ?? 0) < work.revision) pending.set(work.id, work);
+      }
 
       for (const entry of sortedSessions) {
         const session = entry.row;
@@ -275,18 +279,18 @@ function discoverAtStore(
         const isSubagent = entry.isSubagent;
         const state = states.get(session.id) ?? null;
         const replaced = state !== null && (state.store.identity !== store.identity || state.store.schema !== store.schema);
+        const outstanding = pending.get(session.id);
         let changed = state === null || replacedSessionIds.length > 0 || replaced
-          || state.manifest !== entry.manifest;
-        let reconcile = !changed && (unexplainedWrite || state!.recovery < generation);
+          || state.manifest !== entry.manifest || outstanding?.mode === 'replay';
+        let reconcile = !changed && (unexplainedWrite || outstanding?.mode === 'reconcile' || priorObservation === null);
 
         if (isSubagent && session.parent_id !== null && changedRawIds.has(session.parent_id)) {
           changed = true;
           reconcile = false;
         }
-
         if (!changed && !reconcile) continue;
-
         changedRawIds.add(session.id);
+        pending.set(session.id, { id: session.id, revision, mode: reconcile ? 'reconcile' : 'replay' });
         units.push({
           key,
           sessionId,
@@ -300,7 +304,7 @@ function discoverAtStore(
             dbPath,
             rawSessionId: session.id,
             manifest: entry.manifest,
-            recovery: generation,
+            revision,
             store,
             reason: state === null ? 'cursor-upgrade' : replaced ? 'source-replaced' : reconcile ? 'unexplained-write' : 'changed-session',
             ...(reconcile ? { reconcileFingerprint: state!.fingerprint } : {}),
@@ -328,6 +332,15 @@ function discoverAtStore(
         });
       }
 
+      const observation: StoreCursorState = { store, inventory, revision, pending: [...pending.values()] };
+      const observationCursor = encodeStoreCursor(observation);
+      const needsObservation = observationChanged || units.length > 0;
+      if (needsObservation) {
+        for (const unit of units) unit.requiresCursors = [{ key: observationKey, cursor: observationCursor }];
+        units.unshift({ key: observationKey, sessionId: '', meta: {
+          kind: 'opencode-observation', dbPath, observation,
+        } satisfies OpencodeObservationMeta });
+      }
       return units;
     } finally {
       db.exec('COMMIT');
@@ -444,8 +457,32 @@ function* parse(
   opener: OpencodeDatabaseOpener,
 ): Generator<TranscriptRecord, Cursor> {
   const meta = unit.meta as OpencodeUnitMeta;
-  if (!meta || (meta.kind !== 'opencode-session' && meta.kind !== 'opencode-tombstone')) {
+  if (!meta || (meta.kind !== 'opencode-session' && meta.kind !== 'opencode-tombstone' && meta.kind !== 'opencode-observation')) {
     throw new Error('opencode: invalid unit metadata');
+  }
+
+  if (meta.kind === 'opencode-observation') {
+    if (unit.key !== opencodeObservationKey(meta.dbPath) || unit.sessionId !== '') {
+      throw new Error('opencode: invalid observation identity');
+    }
+    const db = openSource(meta.dbPath, opener);
+    if (db === null) throw new RetryableSourceReadError(meta.dbPath, 'opencode: source database is busy or unreadable before observation commit');
+    try {
+      sourceTables(db);
+      const physical = storePhysicalState(meta.dbPath);
+      db.exec('BEGIN');
+      try {
+        const tables = sourceTables(db);
+        const current = observeSessions(db, tables);
+        const inventory = digest([...current].map(([id, e]) => [id, e.manifest]).sort((a, b) => a[0]!.localeCompare(b[0]!)));
+        if (inventory !== meta.observation.inventory || transcriptSchema(db) !== meta.observation.store.schema
+          || physical.identity !== meta.observation.store.identity || physical.stamp !== meta.observation.store.stamp
+          || storePhysicalState(meta.dbPath).stamp !== physical.stamp) {
+          throw new RetryableSourceReadError(meta.dbPath, 'opencode: source changed before observation commit');
+        }
+        return encodeStoreCursor(meta.observation);
+      } finally { db.exec('COMMIT'); }
+    } finally { db.close(); }
   }
 
   const identity = decodeOpencodeUnitKey(unit.key);
@@ -524,7 +561,7 @@ function* parse(
         yield* records;
       }
       return encodeCursor(entry.row.time_updated ?? 0, {
-        manifest: entry.manifest, recovery: meta.recovery, store: meta.store, fingerprint: step.value,
+        manifest: entry.manifest, revision: meta.revision, store: meta.store, fingerprint: step.value,
       });
     } finally {
       db.exec('COMMIT');

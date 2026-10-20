@@ -28,3 +28,8 @@ export function decodeOpencodeUnitKey(key: string): { dbPath: string; nativeId: 
     return { dbPath, nativeId };
   } catch { return null; }
 }
+
+/** Control state shares index_state, never canonical sessions or transcript hints. */
+export function opencodeObservationKey(storePath: string): string {
+  return `__opencode_observation_v1__:${opencodeStoreHash(storePath)}`;
+}

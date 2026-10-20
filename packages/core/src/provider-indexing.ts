@@ -4,6 +4,7 @@
 import { readdirSync, statSync, type Dirent } from 'node:fs';
 import { join } from 'node:path';
 
+import { RetryableSourceReadError } from './providers/source-read-error.ts';
 import { persist } from './persist.ts';
 import type { ProviderRegistry } from './providers/registry.ts';
 import type {
@@ -306,11 +307,11 @@ export function indexProviderPlan({
       const cursor = runTransaction(`provider:${item.provider.name}:${item.unit.key}`, () => {
         // Commit the replay schedule with its first completed unit. After an
         // interruption, newly written cursors identify exactly what can resume.
-        if (!replayScheduleCommitted) {
+        if (!replayScheduleCommitted && item.unit.sessionId !== '') {
           const clear = db.prepare('DELETE FROM index_state WHERE jsonl_path = ?');
           const keysToReplay = new Set(
             plan.items
-              .filter(({ provider }) => plan.pendingMarkers.has(provider.name))
+              .filter(({ provider, unit }) => unit.sessionId !== '' && plan.pendingMarkers.has(provider.name))
               .map(({ unit }) => unit.key),
           );
           for (const keys of plan.replayKeys.values()) {
@@ -319,11 +320,16 @@ export function indexProviderPlan({
           for (const key of keysToReplay) clear.run(key);
           writePendingMarkers(db, plan);
         }
+        for (const required of item.unit.requiresCursors ?? []) {
+          if (storedProviderCursor(db, required.key) !== required.cursor) {
+            throw new RetryableSourceReadError(item.unit.key, `Source observation prerequisite was not committed: ${required.key}`);
+          }
+        }
         const nextCursor = persist(db, item.unit, item.provider.parse(item.unit, item.cursor));
         onPersisted(item, nextCursor);
         return nextCursor;
       });
-      replayScheduleCommitted = true;
+      if (item.unit.sessionId !== '') replayScheduleCommitted = true;
       committed.push(item);
       onCommitted(item, cursor);
     } catch (error) {

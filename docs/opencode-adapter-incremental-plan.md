@@ -168,3 +168,52 @@ against commit 27ef497 and failed on actual full payload reads, then passed with
 this implementation. The 10x-unrelated-history case reads 5 affected payload rows
 per modern update, with zero unchanged payload reads, including cold provider
 reconstruction. Final broader verification remains pending.
+
+### Independent review adjustment: observed state and durable pending work
+
+Fresh Standards and Spec reviews reproduced two gaps in the per-session-only
+prototype: a failed known update masks a later separate data-only sibling edit;
+and a failed forced child replay is forgotten after its parent commits and
+cascades the child's relationship away. Successful-cursor recovery generations
+alone do not prove which source inventory was previously observed.
+
+Use a provider-private observation cursor, following Hermes' existing recordless
+IndexUnit convention (`sessionId: ''`). It stores source identity/schema/stamp,
+metadata inventory digest, observation revision, and pending per-session replay or
+reconciliation requirements. It asserts **observed**, never **completed**. Session
+cursors independently acknowledge required revisions only after successful persist.
+This adds no canonical session, SQLite table, or provider-specific indexer branch.
+
+Pending work must be durable **before** a parent replacement can cascade links.
+The observation unit runs first. Session units declare an optional generic cursor
+prerequisite; the shared per-unit transaction checks the prerequisite cursor before
+persisting. If the observation write fails, dependent work cannot commit. Strict
+rebuild sees the prerequisite inside its existing outer transaction. This small
+IndexUnit extension is necessary to make the already-existing recordless cursor
+pattern crash-safe across dependent unit transactions, without an OpenCode-only
+orchestration hook or a callback into the destination from provider parsing.
+
+The observation adjustment supersedes the earlier per-session-only prototype
+record above. New regressions cover the sequential failed-head/body-edit case,
+failed child plus grandchild replay after restart, and a failed observation write
+preventing every destructive dependent. Focused suites: 85 passed; root/app
+ typecheck: zero errors. The source observation is stored before dependent work,
+not as a later completion gate; exact cursor prerequisites are checked in the
+existing destination transaction. Recordless control units do not start canonical
+marker replay or clear last-good session cursors.
+
+Test representation changes are explicit: transcript-count/projection assertions
+now select transcript units, while complete-plan lifecycle tests execute control
+units too. Last-good cursor comparisons exclude only the separately asserted
+observation row, which intentionally records pending work after a parse failure;
+all prior transcript rows and per-session cursors remain protected. The stale
+rename/restore tombstone plan is rebuilt before successful verification because
+its old physical observation is no longer current. No transcript/rollback/token/
+identity assertion was weakened.
+
+Actual metadata complexity includes session sorting O(S log S), indexed pre-split
+format probes O(S_pre_split log N), and compatibility member enumeration/sorting.
+The payload improvement is independent: zero unchanged payload rows, and only
+changed-session payloads for verified event writers. The source observation adds
+one metadata-only validation snapshot when the observed source or pending work
+changes. It does not restore a full-history payload scan on ordinary updates.
