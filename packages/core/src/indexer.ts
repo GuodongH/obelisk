@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 // Passive-pull indexing orchestration for the Core package.
+import { RetryableSourceReadError } from './providers/source-read-error.ts';
 import { existsSync } from 'node:fs';
 import { DB_PATH, openDb, openReadDb, openWriterLeaseDb } from './db.ts';
 import {
@@ -260,6 +261,9 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
             };
           }
           if (error instanceof ProviderIndexFailure) {
+            if (error.sourceError instanceof RetryableSourceReadError) {
+              inventoryIssues.push({ provider: error.item.provider.name, path: error.sourceError.sourcePath, error: error.sourceError.message });
+            }
             const skippedFile = {
               provider: error.item.provider.name,
               path: error.item.unit.key,
@@ -306,6 +310,9 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
         onError: (error, { provider, unit }) => {
           if (isBeginBusyFailure(error)) return 'stop';
           if (hasUnusableTransaction(error)) throw error;
+          if (error instanceof RetryableSourceReadError) {
+            inventoryIssues.push({ provider: provider.name, path: error.sourcePath, error: error.message });
+          }
           const detail = error as { message?: unknown; obelisk?: unknown } | null;
           const message = errorMessage(error);
           skippedFiles.push({

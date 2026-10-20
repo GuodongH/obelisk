@@ -20,31 +20,31 @@
 //   V2: input_tokens = input + cache.read + cache.write, output_tokens = output + reasoning
 //   V1: step-finish per-step priority; assistant.tokens only when no step-finish occurred.
 
-import { createHash } from 'node:crypto';
 import { existsSync, readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, normalize, sep } from 'node:path';
 
-import { isRecord, parseJson, transcriptObject, modernMessageData, legacyMessageData, legacyPartData, str, parseModelRef, completedCompaction } from './opencode-decode.ts';
+import { encodeCursor, decodeCursor, storePhysicalState } from './opencode-manifest.ts';
+import type { StoreObservation } from './opencode-manifest.ts';
+import { RetryableSourceReadError } from './source-read-error.ts';
+import { parseV1, parseV2, fingerprintSession } from './opencode-project.ts';
+import { checkIsSubagent, sourceTables, readSessionEntry, observeSessions, observeSession, transcriptSchema } from './opencode-source.ts';
+import type { SessionMessageRow, MessageRow, PartRow } from './opencode-source.ts';
+import { isRecord, modernMessageData, legacyMessageData, legacyPartData, str, parseModelRef, completedCompaction } from './opencode-decode.ts';
 export { parseModelRef } from './opencode-decode.ts';
 
 import { decodeOpencodeUnitKey, opencodeSessionId, opencodeUnitKey } from './opencode-identity.ts';
 export { opencodeStoreHash, opencodeSessionId, opencodeUnitKey } from './opencode-identity.ts';
 
-import { normalizeObservedCwd, projectSlugFromPath, trunc, truncJson } from '../parsing.ts';
+import { normalizeObservedCwd, projectSlugFromPath } from '../parsing.ts';
 import type { SqliteDb } from '../sqlite-types.ts';
 import type {
   Cursor,
   DiscoverContext,
   IndexUnit,
-  MessageRecord,
-  MessageVisibility,
   ProviderAdapter,
   RawLookup,
   RawRecord,
-  SessionRecord,
-  SubagentRecord,
-  SummaryRecord,
   TranscriptRecord,
   WatchTarget,
 } from './types.ts';
@@ -55,16 +55,6 @@ export const OPENCODE_CANONICAL_TRANSCRIPT_MARKER = '__opencode_canonical_transc
 const TOMBSTONE_CURSOR = '0:0:v1:tombstone';
 
 export type OpencodeDatabaseOpener = (dbPath: string) => SqliteDb;
-
-function checkIsSubagent(db: SqliteDb, parentId: string | null, tables: ReadonlySet<string>): boolean {
-  if (parentId === null || parentId.length === 0) return false;
-  return (['session_v2', 'session'] as const).some(table => tables.has(table)
-    && db.prepare(`SELECT 1 FROM ${table} WHERE id = ?`).get(parentId) !== undefined);
-}
-
-const timestampOfMs = (time: number | null | undefined): string | null => (
-  typeof time === 'number' && Number.isFinite(time) && time > 0 ? new Date(time).toISOString() : null
-);
 
 export function defaultOpencodeDataRoot(homeDir = homedir()): string {
   const xdg = process.env.XDG_DATA_HOME;
@@ -100,17 +90,6 @@ function openSource(dbPath: string, opener: OpencodeDatabaseOpener): SqliteDb | 
     return opener(dbPath);
   } catch {
     return null;
-  }
-}
-
-function sourceTables(db: SqliteDb): Set<string> {
-  try {
-    return new Set(
-      (db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{ name: unknown }>)
-        .map(r => String(r.name)),
-    );
-  } catch (cause) {
-    throw new Error(`opencode: unable to read transcript tables: ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
   }
 }
 
@@ -166,238 +145,25 @@ function discoverDatabaseFiles(dir: string): string[] {
   }
 }
 
-interface SessionRow {
-  id: string;
-  project_id: string | null;
-  parent_id: string | null;
-  directory: string | null;
-  title: string | null;
-  version: string | null;
-  revert: string | null;
-  cost: number | null;
-  tokens_input: number | null;
-  tokens_output: number | null;
-  tokens_reasoning: number | null;
-  tokens_cache_read: number | null;
-  tokens_cache_write: number | null;
-  time_created: number | null;
-  time_updated: number | null;
-  time_archived: number | null;
-  agent: string | null;
-  model: string | null;
-}
-
-interface SessionMessageRow {
-  id: string;
-  session_id: string;
-  type: string;
-  seq: number;
-  time_created: number;
-  time_updated: number;
-  data: string;
-}
-
-interface MessageRow {
-  id: string;
-  session_id: string;
-  time_created: number;
-  time_updated: number;
-  data: string;
-}
-
-interface PartRow {
-  id: string;
-  message_id: string;
-  session_id: string;
-  time_created: number;
-  time_updated: number;
-  data: string;
-}
-
-interface RevertInfo {
-  messageID: string | null;
-  partID: string | null;
-}
-
-function parseRevert(revert: string | null): RevertInfo | null {
-  if (revert === null) return null;
-  const value = transcriptObject(revert, 'session revert');
-  if (typeof value.messageID !== 'string'
-    || (value.partID !== undefined && value.partID !== null && typeof value.partID !== 'string')) {
-    throw new Error('opencode: invalid revert payload');
-  }
-  return {
-    messageID: str(value.messageID),
-    partID: str(value.partID),
-  };
-}
-
-function fingerprintSession(
-  format: 'v1' | 'v2',
-  session: SessionRow,
-  isSubagent: boolean,
-  v2Messages?: readonly SessionMessageRow[],
-  v1Messages?: readonly MessageRow[],
-  v1Parts?: readonly PartRow[],
-): string {
-  const hash = createHash('sha256');
-  hash.update(JSON.stringify([
-    format,
-    session.id,
-    session.parent_id,
-    session.directory,
-    session.title,
-    session.version,
-    session.revert,
-    session.time_created,
-    session.time_updated,
-    session.time_archived,
-    session.agent,
-    session.model,
-    isSubagent,
-  ]));
-  if (format === 'v2' && v2Messages) {
-    for (const m of v2Messages) {
-      hash.update(`\nm2${JSON.stringify([m.id, m.type, m.seq, m.time_created, m.time_updated, m.data])}`);
-    }
-  } else if (format === 'v1' && v1Messages && v1Parts) {
-    for (const m of v1Messages) {
-      hash.update(`\nm1${JSON.stringify([m.id, m.time_created, m.time_updated, m.data])}`);
-    }
-    for (const p of v1Parts) {
-      hash.update(`\np1${JSON.stringify([p.id, p.message_id, p.time_created, p.time_updated, p.data])}`);
-    }
-  }
-  return hash.digest('hex').slice(0, 24);
-}
-
-interface CursorState {
-  timeUpdated: number;
-  messageCount: number;
-  fingerprint: string;
-}
-
-function encodeCursor(state: CursorState): string {
-  return `${state.timeUpdated}:${state.messageCount}:v1:${state.fingerprint}`;
-}
-
-function decodeCursor(cursor: Cursor): CursorState | null {
-  if (cursor === null) return null;
-  const parts = cursor.split(':');
-  if (parts.length !== 4 || parts[2] !== 'v1') return null;
-  const timeUpdated = Number(parts[0]);
-  const messageCount = Number(parts[1]);
-  if (!Number.isFinite(timeUpdated) || !Number.isFinite(messageCount)) return null;
-  return { timeUpdated, messageCount, fingerprint: parts[3]! };
-}
-
 interface OpencodeSessionMeta {
   kind: 'opencode-session';
   format: 'v1' | 'v2';
   dbPath: string;
   rawSessionId: string;
+  manifest: string;
+  recovery: number;
+  store: StoreObservation;
+  reason: 'changed-session' | 'source-replaced' | 'unexplained-write' | 'cursor-upgrade';
+  reconcileFingerprint?: string;
 }
 
 interface OpencodeTombstoneMeta {
   kind: 'opencode-tombstone';
+  store: StoreObservation;
   dbPath: string;
   rawSessionId: string;
 }
 type OpencodeUnitMeta = OpencodeSessionMeta | OpencodeTombstoneMeta;
-
-const FILE_TOOLS = new Set(['read', 'edit', 'write', 'apply_patch', 'patch']);
-
-function toolFilePath(toolName: string, input: unknown): string | null {
-  if (isRecord(input) && FILE_TOOLS.has(toolName.toLowerCase())) {
-    if (typeof input.path === 'string' && input.path.length > 0) return input.path;
-    if (typeof input.filePath === 'string' && input.filePath.length > 0) return input.filePath;
-  }
-  return null;
-}
-
-function v2UsageTokens(tokens: unknown): { input: number | null; output: number | null } {
-  if (!isRecord(tokens)) return { input: null, output: null };
-  const rawInput = tokens.input;
-  const rawOutput = tokens.output;
-  const rawReasoning = tokens.reasoning;
-  const cache = isRecord(tokens.cache) ? tokens.cache : {};
-  const cacheRead = typeof cache.read === 'number' && Number.isFinite(cache.read) ? cache.read : 0;
-  const cacheWrite = typeof cache.write === 'number' && Number.isFinite(cache.write) ? cache.write : 0;
-
-  let input: number | null = null;
-  if (typeof rawInput === 'number' && Number.isFinite(rawInput)) {
-    input = rawInput + cacheRead + cacheWrite;
-  }
-  let output: number | null = null;
-  if (typeof rawOutput === 'number' && Number.isFinite(rawOutput)) {
-    const reasoning = typeof rawReasoning === 'number' && Number.isFinite(rawReasoning) ? rawReasoning : 0;
-    output = rawOutput + reasoning;
-  }
-  return { input, output };
-}
-
-function v1StepUsageTokens(tokens: unknown): { input: number | null; output: number | null } {
-  if (!isRecord(tokens)) return { input: null, output: null };
-  const rawInput = tokens.input;
-  const rawOutput = tokens.output;
-  const rawReasoning = tokens.reasoning;
-  const cache = isRecord(tokens.cache) ? tokens.cache : {};
-  const cacheRead = typeof cache.read === 'number' && Number.isFinite(cache.read) ? cache.read : 0;
-  const cacheWrite = typeof cache.write === 'number' && Number.isFinite(cache.write) ? cache.write : 0;
-
-  let input: number | null = null;
-  if (typeof rawInput === 'number' && Number.isFinite(rawInput)) {
-    input = rawInput + cacheRead + cacheWrite;
-  }
-  let output: number | null = null;
-  if (typeof rawOutput === 'number' && Number.isFinite(rawOutput)) {
-    const reasoning = typeof rawReasoning === 'number' && Number.isFinite(rawReasoning) ? rawReasoning : 0;
-    output = rawOutput + reasoning;
-  }
-  return { input, output };
-}
-
-interface DiscoveredSessionEntry {
-  format: 'v1' | 'v2';
-  row: SessionRow;
-}
-
-type SessionTable = 'session_v2' | 'session';
-
-function sessionSelect(table: SessionTable): string {
-  // Metadata tables and wire formats have separate lifecycles: before the V2
-  // split (v1.19.3), modern session_message rows also belonged to `session`.
-  return `SELECT id, project_id, parent_id, directory, title, version, revert, cost,
-    tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write,
-    time_created, time_updated, time_archived, agent, model FROM ${table}`;
-}
-
-function sessionFormat(
-  db: SqliteDb,
-  tables: ReadonlySet<string>,
-  table: SessionTable,
-  id: string,
-  modernIds?: ReadonlySet<string>,
-): 'v1' | 'v2' {
-  const modern = tables.has('session_message');
-  const legacy = tables.has('message') && tables.has('part');
-  if (modern && (table === 'session_v2' || !legacy || (modernIds
-    ? modernIds.has(id)
-    : db.prepare('SELECT 1 FROM session_message WHERE session_id = ? LIMIT 1').get(id) !== undefined))) {
-    return 'v2';
-  }
-  if (table === 'session' && legacy) return 'v1';
-  throw new Error(`opencode: no recognized message tables for ${table} session ${id}`);
-}
-
-function readSessionEntry(db: SqliteDb, tables: ReadonlySet<string>, id: string): DiscoveredSessionEntry | undefined {
-  for (const table of ['session_v2', 'session'] as const) {
-    if (!tables.has(table)) continue;
-    const row = db.prepare(`${sessionSelect(table)} WHERE id = ?`).get(id) as unknown as SessionRow | undefined;
-    if (row !== undefined) return { row, format: sessionFormat(db, tables, table, id) };
-  }
-  return undefined;
-}
 
 function discoverAtStore(
   dbPath: string,
@@ -442,47 +208,21 @@ function discoverAtStore(
   }
 
   try {
+    sourceTables(db); // Initialize SQLite's read-only WAL coordination before sampling files.
+    const physical = storePhysicalState(dbPath);
     db.exec('BEGIN');
     try {
       const tables = sourceTables(db);
-      const hasModern = tables.has('session_message');
-      const hasLegacy = tables.has('message') && tables.has('part');
-      if ((!tables.has('session_v2') && !tables.has('session')) || (!hasModern && !hasLegacy)) {
-        throw new Error('Session database has no recognized transcript tables');
-      }
-
-      const v2Counts = new Map<string, number>();
-      if (hasModern) {
-        for (const r of db.prepare(
-          'SELECT session_id, COUNT(*) as c FROM session_message GROUP BY session_id',
-        ).all() as unknown as Array<{ session_id: string; c: number }>) {
-          v2Counts.set(r.session_id, r.c);
-        }
-      }
-      const v1Counts = new Map<string, number>();
-      if (hasLegacy) {
-        for (const r of db.prepare(
-          'SELECT session_id, COUNT(*) as c FROM message GROUP BY session_id',
-        ).all() as unknown as Array<{ session_id: string; c: number }>) {
-          v1Counts.set(r.session_id, r.c);
-        }
-      }
-
-      const modernIds = new Set(v2Counts.keys());
-      const sessionsMap = new Map<string, DiscoveredSessionEntry>();
-      for (const table of ['session_v2', 'session'] as const) {
-        if (!tables.has(table)) continue;
-        for (const row of db.prepare(sessionSelect(table)).all() as unknown as SessionRow[]) {
-          if (!sessionsMap.has(row.id)) {
-            sessionsMap.set(row.id, { row, format: sessionFormat(db, tables, table, row.id, modernIds) });
-          }
-        }
+      const schema = transcriptSchema(db);
+      const store: StoreObservation = { ...physical, schema };
+      const sessionsMap = observeSessions(db, tables);
+      if (storePhysicalState(dbPath).stamp !== store.stamp) {
+        throw new RetryableSourceReadError(dbPath, 'opencode: source changed during inventory');
       }
 
       const units: IndexUnit[] = [];
       const liveSessionIds = new Set<string>();
       const liveUnitKeys = new Set<string>();
-      const liveRawIds = new Set(sessionsMap.keys());
       const indexedSessions = ctx.indexedSessions?.() ?? [];
       const indexedByKey = new Map<string, string[]>();
       for (const indexed of indexedSessions) {
@@ -508,6 +248,21 @@ function discoverAtStore(
       );
 
       const changedRawIds = new Set<string>();
+      const states = new Map(sortedSessions.map(({ row }) => [row.id, decodeCursor(ctx.lastCursor(opencodeUnitKey(dbPath, row.id)))]));
+      const priorInStore = indexedSessions.filter(s => decodeOpencodeUnitKey(s.jsonlPath)?.dbPath === normalize(dbPath));
+      const hasKnownChange = sortedSessions.some(entry => {
+        const state = states.get(entry.row.id);
+        return state == null || state.manifest !== entry.manifest
+          || state.store.identity !== store.identity || state.store.schema !== store.schema;
+      }) || priorInStore.some(s => !sessionsMap.has(decodeOpencodeUnitKey(s.jsonlPath)!.nativeId));
+      const stampAcknowledged = [...states.values()].some(state => state?.store.identity === store.identity
+        && state.store.schema === store.schema && state.store.stamp === store.stamp);
+      const unexplainedWrite = !hasKnownChange && !stampAcknowledged;
+      // A reconciliation is complete per unit, never just because one sibling
+      // acknowledged this store stamp. Carry its generation in successful cursors
+      // so failed units remain pending across partial commits and restarts.
+      const recoveryStates = [...states.values(), ...priorInStore.map(s => decodeCursor(ctx.lastCursor(s.jsonlPath)))];
+      const generation = recoveryStates.reduce((max, state) => Math.max(max, state?.recovery ?? 0), 0) + (unexplainedWrite ? 1 : 0);
 
       for (const entry of sortedSessions) {
         const session = entry.row;
@@ -517,43 +272,19 @@ function discoverAtStore(
         liveUnitKeys.add(key);
 
         const replacedSessionIds = (indexedByKey.get(key) ?? []).filter(id => id !== sessionId);
-        const count = entry.format === 'v2'
-          ? (v2Counts.get(session.id) ?? 0)
-          : (v1Counts.get(session.id) ?? 0);
-
-        const isSubagent = session.parent_id !== null && liveRawIds.has(session.parent_id);
-        const cursor = ctx.lastCursor(key);
-        const state = decodeCursor(cursor);
-
-        let changed = state === null || replacedSessionIds.length > 0;
-        if (state !== null && !changed) {
-          const l1Match = state.timeUpdated === (session.time_updated ?? 0)
-            && state.messageCount === count;
-          if (l1Match) {
-            if (entry.format === 'v2') {
-              const msgs = db.prepare(
-                'SELECT id, session_id, type, seq, time_created, time_updated, data FROM session_message WHERE session_id = ? ORDER BY seq, time_created, id',
-              ).all(session.id) as unknown as SessionMessageRow[];
-              changed = fingerprintSession('v2', session, isSubagent, msgs) !== state.fingerprint;
-            } else {
-              const msgs = db.prepare(
-                'SELECT id, session_id, time_created, time_updated, data FROM message WHERE session_id = ? ORDER BY time_created, id',
-              ).all(session.id) as unknown as MessageRow[];
-              const parts = db.prepare(
-                'SELECT id, message_id, session_id, time_created, time_updated, data FROM part WHERE session_id = ? ORDER BY id',
-              ).all(session.id) as unknown as PartRow[];
-              changed = fingerprintSession('v1', session, isSubagent, undefined, msgs, parts) !== state.fingerprint;
-            }
-          } else {
-            changed = true;
-          }
-        }
+        const isSubagent = entry.isSubagent;
+        const state = states.get(session.id) ?? null;
+        const replaced = state !== null && (state.store.identity !== store.identity || state.store.schema !== store.schema);
+        let changed = state === null || replacedSessionIds.length > 0 || replaced
+          || state.manifest !== entry.manifest;
+        let reconcile = !changed && (unexplainedWrite || state!.recovery < generation);
 
         if (isSubagent && session.parent_id !== null && changedRawIds.has(session.parent_id)) {
           changed = true;
+          reconcile = false;
         }
 
-        if (!changed) continue;
+        if (!changed && !reconcile) continue;
 
         changedRawIds.add(session.id);
         units.push({
@@ -562,12 +293,17 @@ function discoverAtStore(
           project: projectSlugFromPath(normalizeObservedCwd(session.directory)) ?? undefined,
           isSubagent,
           agentId: isSubagent ? sessionId : undefined,
-          retractSessionIds: [sessionId, ...replacedSessionIds],
+          ...(reconcile ? {} : { retractSessionIds: [sessionId, ...replacedSessionIds] }),
           meta: {
             kind: 'opencode-session',
             format: entry.format,
             dbPath,
             rawSessionId: session.id,
+            manifest: entry.manifest,
+            recovery: generation,
+            store,
+            reason: state === null ? 'cursor-upgrade' : replaced ? 'source-replaced' : reconcile ? 'unexplained-write' : 'changed-session',
+            ...(reconcile ? { reconcileFingerprint: state!.fingerprint } : {}),
           } satisfies OpencodeUnitMeta,
         });
       }
@@ -585,6 +321,7 @@ function discoverAtStore(
           retractSessionIds: [indexed.sessionId],
           meta: {
             kind: 'opencode-tombstone',
+            store,
             dbPath,
             rawSessionId: identity.nativeId,
           } satisfies OpencodeUnitMeta,
@@ -701,1039 +438,6 @@ function discoverAll(
   return units;
 }
 
-function* parseV2(
-  unit: IndexUnit,
-  meta: OpencodeSessionMeta,
-  db: SqliteDb,
-  session: SessionRow,
-): Generator<TranscriptRecord, Cursor> {
-  const sessionId = unit.sessionId;
-  const isSubagent = unit.isSubagent === true;
-
-  const messages = db.prepare(
-    'SELECT id, session_id, type, seq, time_created, time_updated, data FROM session_message WHERE session_id = ? ORDER BY seq, time_created, id',
-  ).all(meta.rawSessionId) as unknown as SessionMessageRow[];
-
-  const fingerprint = fingerprintSession('v2', session, isSubagent, messages);
-  const revert = parseRevert(session.revert);
-
-  let activeCutIndex = -1;
-  if (revert?.messageID) {
-    activeCutIndex = messages.findIndex(m => m.id === revert.messageID);
-  }
-
-  const startedAt = timestampOfMs(session.time_created);
-  let endedAt: string | null = null;
-  const gitBranch: string | null = null;
-  let visibleCount = 0;
-  let previousMessageUuid: string | null = null;
-  const records: TranscriptRecord[] = [];
-
-  for (let mIdx = 0; mIdx < messages.length; mIdx++) {
-    const m = messages[mIdx]!;
-    const isMessageActive = activeCutIndex === -1 || mIdx < activeCutIndex;
-    const baseVisibility: MessageVisibility = isMessageActive ? 'visible' : 'inactive';
-    const messageTimestamp = timestampOfMs(m.time_created);
-    const data = modernMessageData(m);
-
-    if (isMessageActive && m.time_updated) {
-      const updatedTime = timestampOfMs(m.time_updated);
-      if (updatedTime !== null && (endedAt === null || updatedTime > endedAt)) {
-        endedAt = updatedTime;
-      }
-    }
-
-    if (m.type === 'compaction') {
-      const summaryText = completedCompaction(data);
-      if (summaryText !== null) {
-        const usage = v2UsageTokens(data.tokens);
-        records.push({
-          kind: 'summary',
-          id: `${sessionId}:summary:${encodeURIComponent(m.id)}`,
-          session_id: sessionId,
-          timestamp: messageTimestamp,
-          source: name,
-          content: trunc(summaryText),
-          visibility: baseVisibility,
-          input_tokens: usage.input,
-          output_tokens: usage.output,
-        } satisfies SummaryRecord);
-      } else {
-        const usage = v2UsageTokens(data.tokens);
-        if (usage.input !== null || usage.output !== null) {
-          const uuid = `${sessionId}:m:${String(m.seq).padStart(6, '0')}:${encodeURIComponent(m.id)}:msg`;
-          records.push({
-            kind: 'message',
-            uuid,
-            session_id: sessionId,
-            type: 'system',
-            parent_uuid: previousMessageUuid,
-            timestamp: messageTimestamp,
-            role: 'system',
-            text: null,
-            content_type: 'unknown',
-            is_meta: 1,
-            visibility: 'hidden',
-            model: parseModelRef(session.model) ?? null,
-            is_sidechain: isSubagent ? 1 : 0,
-            agent_id: isSubagent ? sessionId : null,
-            input_tokens: usage.input,
-            output_tokens: usage.output,
-            cwd: session.directory ?? null,
-            skill: null,
-            source: name,
-          } satisfies MessageRecord);
-          previousMessageUuid = uuid;
-        }
-      }
-      continue;
-    }
-
-    if (m.type === 'system' || m.type === 'synthetic') {
-      const uuid = `${sessionId}:m:${String(m.seq).padStart(6, '0')}:${encodeURIComponent(m.id)}:msg`;
-      const text = str(data.text);
-      visibleCount += baseVisibility === 'visible' ? 1 : 0;
-      records.push({
-        kind: 'message',
-        uuid,
-        session_id: sessionId,
-        type: 'system',
-        parent_uuid: previousMessageUuid,
-        timestamp: messageTimestamp,
-        role: 'system',
-        text: text !== null ? trunc(text) : null,
-        content_type: text !== null ? 'text' : 'unknown',
-        is_meta: 1,
-        visibility: baseVisibility,
-        model: parseModelRef(session.model) ?? null,
-        is_sidechain: isSubagent ? 1 : 0,
-        agent_id: isSubagent ? sessionId : null,
-        input_tokens: null,
-        output_tokens: null,
-        cwd: session.directory ?? null,
-        skill: null,
-        source: name,
-      } satisfies MessageRecord);
-      previousMessageUuid = uuid;
-      continue;
-    }
-
-    if (m.type === 'model-switched') {
-      const uuid = `${sessionId}:m:${String(m.seq).padStart(6, '0')}:${encodeURIComponent(m.id)}:msg`;
-      const toModel = parseModelRef(data.model);
-      const fromModel = parseModelRef(data.previous);
-      const cardText = fromModel !== null && toModel !== null
-        ? `model ${fromModel} → ${toModel}`
-        : `model → ${toModel ?? fromModel ?? 'default'}`;
-      visibleCount += baseVisibility === 'visible' ? 1 : 0;
-      records.push({
-        kind: 'message',
-        uuid,
-        session_id: sessionId,
-        type: 'system',
-        parent_uuid: previousMessageUuid,
-        timestamp: messageTimestamp,
-        role: 'system',
-        text: cardText,
-        content_type: 'text',
-        is_meta: 1,
-        visibility: baseVisibility,
-        model: toModel ?? parseModelRef(session.model) ?? null,
-        is_sidechain: isSubagent ? 1 : 0,
-        agent_id: isSubagent ? sessionId : null,
-        input_tokens: null,
-        output_tokens: null,
-        cwd: session.directory ?? null,
-        skill: null,
-        source: name,
-      } satisfies MessageRecord);
-      previousMessageUuid = uuid;
-      continue;
-    }
-
-    if (m.type === 'agent-switched') {
-      const uuid = `${sessionId}:m:${String(m.seq).padStart(6, '0')}:${encodeURIComponent(m.id)}:msg`;
-      const toAgent = str(data.agent);
-      const fromAgent = str(data.previous);
-      const cardText = fromAgent !== null && toAgent !== null
-        ? `agent ${fromAgent} → ${toAgent}`
-        : `agent → ${toAgent ?? fromAgent ?? 'default'}`;
-      visibleCount += baseVisibility === 'visible' ? 1 : 0;
-      records.push({
-        kind: 'message',
-        uuid,
-        session_id: sessionId,
-        type: 'system',
-        parent_uuid: previousMessageUuid,
-        timestamp: messageTimestamp,
-        role: 'system',
-        text: cardText,
-        content_type: 'text',
-        is_meta: 1,
-        visibility: baseVisibility,
-        model: parseModelRef(session.model) ?? null,
-        is_sidechain: isSubagent ? 1 : 0,
-        agent_id: isSubagent ? sessionId : null,
-        input_tokens: null,
-        output_tokens: null,
-        cwd: session.directory ?? null,
-        skill: null,
-        source: name,
-      } satisfies MessageRecord);
-      previousMessageUuid = uuid;
-      continue;
-    }
-
-    if (m.type === 'location-switched') {
-      const uuid = `${sessionId}:m:${String(m.seq).padStart(6, '0')}:${encodeURIComponent(m.id)}:msg`;
-      visibleCount += baseVisibility === 'visible' ? 1 : 0;
-      records.push({
-        kind: 'message',
-        uuid,
-        session_id: sessionId,
-        type: 'system',
-        parent_uuid: previousMessageUuid,
-        timestamp: messageTimestamp,
-        role: 'system',
-        text: 'location switched',
-        content_type: 'text',
-        is_meta: 1,
-        visibility: baseVisibility,
-        model: parseModelRef(session.model) ?? null,
-        is_sidechain: isSubagent ? 1 : 0,
-        agent_id: isSubagent ? sessionId : null,
-        input_tokens: null,
-        output_tokens: null,
-        cwd: session.directory ?? null,
-        skill: null,
-        source: name,
-      } satisfies MessageRecord);
-      previousMessageUuid = uuid;
-      continue;
-    }
-
-    if (m.type === 'idle') {
-      const uuid = `${sessionId}:m:${String(m.seq).padStart(6, '0')}:${encodeURIComponent(m.id)}:msg`;
-      records.push({
-        kind: 'message',
-        uuid,
-        session_id: sessionId,
-        type: 'system',
-        parent_uuid: previousMessageUuid,
-        timestamp: messageTimestamp,
-        role: 'system',
-        text: null,
-        content_type: 'unknown',
-        is_meta: 1,
-        visibility: 'hidden',
-        model: parseModelRef(session.model) ?? null,
-        is_sidechain: isSubagent ? 1 : 0,
-        agent_id: isSubagent ? sessionId : null,
-        input_tokens: null,
-        output_tokens: null,
-        cwd: session.directory ?? null,
-        skill: null,
-        source: name,
-      } satisfies MessageRecord);
-      previousMessageUuid = uuid;
-      continue;
-    }
-
-    if (m.type === 'user') {
-      const uuid = `${sessionId}:m:${String(m.seq).padStart(6, '0')}:${encodeURIComponent(m.id)}:msg`;
-      const userText = str(data.text);
-      visibleCount += baseVisibility === 'visible' ? 1 : 0;
-      records.push({
-        kind: 'message',
-        uuid,
-        session_id: sessionId,
-        type: 'user',
-        parent_uuid: previousMessageUuid,
-        timestamp: messageTimestamp,
-        role: 'user',
-        text: userText !== null ? trunc(userText) : null,
-        content_type: userText !== null ? 'text' : 'unknown',
-        is_meta: 0,
-        visibility: baseVisibility,
-        model: null,
-        is_sidechain: isSubagent ? 1 : 0,
-        agent_id: isSubagent ? sessionId : null,
-        input_tokens: null,
-        output_tokens: null,
-        cwd: session.directory ?? null,
-        skill: null,
-        source: name,
-      } satisfies MessageRecord);
-      previousMessageUuid = uuid;
-      continue;
-    }
-
-    if (m.type === 'assistant') {
-      const model = parseModelRef(data.model) ?? parseModelRef(session.model) ?? null;
-      const content = Array.isArray(data.content) ? data.content : [];
-      const assistantRecords: MessageRecord[] = [];
-      let hasToolCall = false;
-
-      for (let cIdx = 0; cIdx < content.length; cIdx++) {
-        const item = content[cIdx];
-        if (!isRecord(item)) continue;
-        const itemType = str(item.type);
-        const blockKey = String(cIdx).padStart(4, '0');
-
-        if (itemType === 'text') {
-          const textVal = str(item.text);
-          if (textVal === null) continue;
-          const uuid = `${sessionId}:m:${String(m.seq).padStart(6, '0')}:${encodeURIComponent(m.id)}:c:${blockKey}:text`;
-          visibleCount += baseVisibility === 'visible' ? 1 : 0;
-          const record: MessageRecord = {
-            kind: 'message',
-            uuid,
-            session_id: sessionId,
-            type: 'assistant',
-            parent_uuid: previousMessageUuid,
-            timestamp: messageTimestamp,
-            role: 'assistant',
-            text: trunc(textVal),
-            content_type: 'text',
-            is_meta: 0,
-            visibility: baseVisibility,
-            model,
-            is_sidechain: isSubagent ? 1 : 0,
-            agent_id: isSubagent ? sessionId : null,
-            input_tokens: null,
-            output_tokens: null,
-            cwd: session.directory ?? null,
-            skill: null,
-            source: name,
-          };
-          assistantRecords.push(record);
-          records.push(record);
-          previousMessageUuid = uuid;
-        } else if (itemType === 'reasoning') {
-          const thinkVal = str(item.text);
-          if (thinkVal === null) continue;
-          const uuid = `${sessionId}:m:${String(m.seq).padStart(6, '0')}:${encodeURIComponent(m.id)}:c:${blockKey}:think`;
-          visibleCount += baseVisibility === 'visible' ? 1 : 0;
-          const record: MessageRecord = {
-            kind: 'message',
-            uuid,
-            session_id: sessionId,
-            type: 'assistant',
-            parent_uuid: previousMessageUuid,
-            timestamp: messageTimestamp,
-            role: 'assistant',
-            text: trunc(thinkVal),
-            content_type: 'thinking',
-            is_meta: 0,
-            visibility: baseVisibility,
-            model,
-            is_sidechain: isSubagent ? 1 : 0,
-            agent_id: isSubagent ? sessionId : null,
-            input_tokens: null,
-            output_tokens: null,
-            cwd: session.directory ?? null,
-            skill: null,
-            source: name,
-          };
-          assistantRecords.push(record);
-          records.push(record);
-          previousMessageUuid = uuid;
-        } else if (itemType === 'tool') {
-          const callId = str(item.id);
-          const toolName = str(item.name);
-          if (callId === null || toolName === null) continue;
-          hasToolCall = true;
-
-          const uuid = `${sessionId}:m:${String(m.seq).padStart(6, '0')}:${encodeURIComponent(m.id)}:c:${blockKey}:tool`;
-          const toolCallId = `${uuid}:call:${encodeURIComponent(callId)}`;
-          const state = isRecord(item.state) ? item.state : {};
-          const status = str(state.status);
-          const input = state.input ?? {};
-          const filePath = toolFilePath(toolName, input);
-
-          visibleCount += baseVisibility === 'visible' ? 1 : 0;
-          const record: MessageRecord = {
-            kind: 'message',
-            uuid,
-            session_id: sessionId,
-            type: 'assistant',
-            parent_uuid: previousMessageUuid,
-            timestamp: messageTimestamp,
-            role: 'assistant',
-            text: null,
-            content_type: 'tool_use',
-            is_meta: 0,
-            visibility: baseVisibility,
-            model,
-            is_sidechain: isSubagent ? 1 : 0,
-            agent_id: isSubagent ? sessionId : null,
-            input_tokens: null,
-            output_tokens: null,
-            cwd: session.directory ?? null,
-            skill: null,
-            source: name,
-          };
-          assistantRecords.push(record);
-          records.push(record);
-          previousMessageUuid = uuid;
-
-          records.push({
-            kind: 'tool_call',
-            id: toolCallId,
-            message_uuid: uuid,
-            session_id: sessionId,
-            name: toolName,
-            presentation: 'default',
-            input_json: truncJson(input) ?? '{}',
-            file_path: filePath,
-          });
-
-          if (status === 'completed' || status === 'error') {
-            let contentStr = '';
-            const isError: 0 | 1 = status === 'error' ? 1 : 0;
-            if (status === 'error') {
-              contentStr = typeof state.error === 'string'
-                ? state.error
-                : JSON.stringify(state.error ?? '');
-            } else if (typeof state.content === 'string') {
-              contentStr = state.content;
-            } else if (Array.isArray(state.content)) {
-              contentStr = state.content
-                .map(c => (isRecord(c) && typeof c.text === 'string' ? c.text : JSON.stringify(c)))
-                .join('\n');
-            } else if (state.output !== undefined && state.output !== null) {
-              contentStr = typeof state.output === 'string'
-                ? state.output
-                : JSON.stringify(state.output);
-            }
-            records.push({
-              kind: 'tool_result',
-              tool_use_id: toolCallId,
-              message_uuid: uuid,
-              session_id: sessionId,
-              content: trunc(contentStr),
-              file_path: filePath,
-              is_error: isError,
-            });
-          }
-        }
-      }
-
-      // If no text/think/tool messages emitted, emit textless anchor
-      if (assistantRecords.length === 0) {
-        const uuid = `${sessionId}:m:${String(m.seq).padStart(6, '0')}:${encodeURIComponent(m.id)}:msg`;
-        visibleCount += baseVisibility === 'visible' ? 1 : 0;
-        const record: MessageRecord = {
-          kind: 'message',
-          uuid,
-          session_id: sessionId,
-          type: 'assistant',
-          parent_uuid: previousMessageUuid,
-          timestamp: messageTimestamp,
-          role: 'assistant',
-          text: null,
-          content_type: hasToolCall ? 'tool_use' : 'unknown',
-          is_meta: 0,
-          visibility: baseVisibility,
-          model,
-          is_sidechain: isSubagent ? 1 : 0,
-          agent_id: isSubagent ? sessionId : null,
-          input_tokens: null,
-          output_tokens: null,
-          cwd: session.directory ?? null,
-          skill: null,
-          source: name,
-        };
-        assistantRecords.push(record);
-        records.push(record);
-        previousMessageUuid = uuid;
-      }
-
-      // Attach token usage to the final assistant message record
-      const usage = v2UsageTokens(data.tokens);
-      if (assistantRecords.length > 0) {
-        const lastRecord = assistantRecords.at(-1)!;
-        lastRecord.input_tokens = usage.input;
-        lastRecord.output_tokens = usage.output;
-      }
-      continue;
-    }
-
-    if (m.type === 'skill') {
-      const uuid = `${sessionId}:m:${String(m.seq).padStart(6, '0')}:${encodeURIComponent(m.id)}:msg`;
-      const skillName = str(data.name) ?? str(data.skill);
-      const instructions = str(data.instructions) ?? str(data.text);
-      visibleCount += baseVisibility === 'visible' ? 1 : 0;
-      records.push({
-        kind: 'message',
-        uuid,
-        session_id: sessionId,
-        type: 'system',
-        parent_uuid: previousMessageUuid,
-        timestamp: messageTimestamp,
-        role: 'system',
-        text: instructions !== null ? trunc(instructions) : null,
-        content_type: instructions !== null ? 'skill_instructions' : 'text',
-        is_meta: 1,
-        visibility: baseVisibility,
-        model: parseModelRef(session.model) ?? null,
-        is_sidechain: isSubagent ? 1 : 0,
-        agent_id: isSubagent ? sessionId : null,
-        input_tokens: null,
-        output_tokens: null,
-        cwd: session.directory ?? null,
-        skill: skillName ?? null,
-        source: name,
-      } satisfies MessageRecord);
-      previousMessageUuid = uuid;
-      continue;
-    }
-
-    if (m.type === 'shell') {
-      const uuid = `${sessionId}:m:${String(m.seq).padStart(6, '0')}:${encodeURIComponent(m.id)}:msg`;
-      const command = str(data.command);
-      const status = str(data.status);
-      const output = typeof data.output === 'string' ? data.output
-        : isRecord(data.output) && typeof data.output.output === 'string' ? data.output.output : '';
-      const terminal = status === 'exited' || status === 'timeout' || status === 'killed'
-        || status === 'completed' || status === 'error'
-        || (status === null && isRecord(data.time) && typeof data.time.completed === 'number');
-      const failed = status === 'timeout' || status === 'killed' || status === 'error'
-        || (status === 'exited' && typeof data.exit === 'number' && data.exit !== 0);
-      const toolCallId = `${uuid}:call:${encodeURIComponent(m.id)}`;
-      const usage = v2UsageTokens(data.tokens);
-      visibleCount += baseVisibility === 'visible' ? 1 : 0;
-      records.push({
-        kind: 'message',
-        uuid,
-        session_id: sessionId,
-        type: 'assistant',
-        parent_uuid: previousMessageUuid,
-        timestamp: messageTimestamp,
-        role: 'assistant',
-        text: null,
-        content_type: 'tool_use',
-        is_meta: 0,
-        visibility: baseVisibility,
-        model: parseModelRef(session.model) ?? null,
-        is_sidechain: isSubagent ? 1 : 0,
-        agent_id: isSubagent ? sessionId : null,
-        input_tokens: usage.input,
-        output_tokens: usage.output,
-        cwd: session.directory ?? null,
-        skill: null,
-        source: name,
-      } satisfies MessageRecord);
-      records.push({
-        kind: 'tool_call',
-        id: toolCallId,
-        message_uuid: uuid,
-        session_id: sessionId,
-        name: 'bash',
-        presentation: 'default',
-        input_json: JSON.stringify({ command: command ?? '' }),
-        file_path: null,
-      });
-      if (terminal || output.length > 0) {
-        records.push({
-          kind: 'tool_result',
-          tool_use_id: toolCallId,
-          message_uuid: uuid,
-          session_id: sessionId,
-          content: trunc(output),
-          file_path: null,
-          is_error: failed ? 1 : 0,
-        });
-      }
-      previousMessageUuid = uuid;
-      continue;
-    }
-
-    // Preserved audit record for unknown future-type
-    const uuid = `${sessionId}:m:${String(m.seq).padStart(6, '0')}:${encodeURIComponent(m.id)}:msg`;
-    const text = str(data.text) ?? (typeof m.data === 'string' && m.data.length > 0 ? m.data : null);
-    visibleCount += baseVisibility === 'visible' ? 1 : 0;
-    records.push({
-      kind: 'message',
-      uuid,
-      session_id: sessionId,
-      type: 'system',
-      parent_uuid: previousMessageUuid,
-      timestamp: messageTimestamp,
-      role: 'system',
-      text: text !== null ? trunc(text) : null,
-      content_type: text !== null ? 'text' : 'unknown',
-      is_meta: 1,
-      visibility: baseVisibility,
-      model: parseModelRef(session.model) ?? null,
-      is_sidechain: isSubagent ? 1 : 0,
-      agent_id: isSubagent ? sessionId : null,
-      input_tokens: null,
-      output_tokens: null,
-      cwd: session.directory ?? null,
-      skill: null,
-      source: name,
-    } satisfies MessageRecord);
-    previousMessageUuid = uuid;
-  }
-
-  if (isSubagent && session.parent_id !== null) {
-    records.push({
-      kind: 'subagent',
-      agent_id: sessionId,
-      session_id: opencodeSessionId(session.parent_id, meta.dbPath),
-      parent_tool_use_id: null,
-      agent_type: session.agent ?? null,
-      description: session.title ?? null,
-      duration_ms: null,
-      total_tokens: null,
-    } satisfies SubagentRecord);
-  }
-
-  records.push({
-    kind: 'session',
-    id: sessionId,
-    title: session.title ?? null,
-    project: projectSlugFromPath(normalizeObservedCwd(session.directory)),
-    started_at: startedAt,
-    ended_at: endedAt ?? timestampOfMs(session.time_updated ?? session.time_created),
-    git_branch: gitBranch,
-    version: session.version ?? null,
-    message_count: visibleCount,
-    countMode: 'total',
-    jsonl_path: unit.key,
-    source: name,
-  } satisfies SessionRecord);
-
-  for (const record of records) yield record;
-
-  return encodeCursor({
-    timeUpdated: session.time_updated ?? 0,
-    messageCount: messages.length,
-    fingerprint,
-  });
-}
-
-function* parseV1(
-  unit: IndexUnit,
-  meta: OpencodeSessionMeta,
-  db: SqliteDb,
-  session: SessionRow,
-): Generator<TranscriptRecord, Cursor> {
-  const sessionId = unit.sessionId;
-  const isSubagent = unit.isSubagent === true;
-
-  const messages = db.prepare(
-    'SELECT id, session_id, time_created, time_updated, data FROM message WHERE session_id = ? ORDER BY time_created, id',
-  ).all(meta.rawSessionId) as unknown as MessageRow[];
-
-  const parts = db.prepare(
-    'SELECT id, message_id, session_id, time_created, time_updated, data FROM part WHERE session_id = ? ORDER BY id',
-  ).all(meta.rawSessionId) as unknown as PartRow[];
-
-  const fingerprint = fingerprintSession('v1', session, isSubagent, undefined, messages, parts);
-  const revert = parseRevert(session.revert);
-
-  const partsByMessage = new Map<string, PartRow[]>();
-  for (const part of parts) {
-    const list = partsByMessage.get(part.message_id) ?? [];
-    list.push(part);
-    partsByMessage.set(part.message_id, list);
-  }
-
-  let revertMessageIndex = -1;
-  if (revert?.messageID) {
-    revertMessageIndex = messages.findIndex(m => m.id === revert.messageID);
-  }
-
-  const startedAt = timestampOfMs(session.time_created);
-  let endedAt: string | null = null;
-  const gitBranch: string | null = null;
-  let visibleCount = 0;
-  let previousMessageUuid: string | null = null;
-  const records: TranscriptRecord[] = [];
-
-  for (let mIdx = 0; mIdx < messages.length; mIdx++) {
-    const m = messages[mIdx]!;
-    const mData = legacyMessageData(m);
-    const role = str(mData.role) ?? 'user';
-    const messageTimestamp = timestampOfMs(m.time_created);
-    const mParts = partsByMessage.get(m.id) ?? [];
-
-    const isAtRevert = revertMessageIndex !== -1 && mIdx === revertMessageIndex;
-    const isAfterRevert = revertMessageIndex !== -1 && mIdx > revertMessageIndex;
-
-    if (!isAfterRevert && m.time_updated) {
-      const updatedTime = timestampOfMs(m.time_updated);
-      if (updatedTime !== null && (endedAt === null || updatedTime > endedAt)) {
-        endedAt = updatedTime;
-      }
-    }
-
-    if (role === 'user') {
-      let revertPartFound = false;
-      let userEmittedAny = false;
-      for (let pIdx = 0; pIdx < mParts.length; pIdx++) {
-        const p = mParts[pIdx]!;
-        const pData = legacyPartData(p);
-        let isPartActive = true;
-        if (isAfterRevert) {
-          isPartActive = false;
-        } else if (isAtRevert) {
-          if (revert?.partID === null) {
-            isPartActive = false;
-          } else if (p.id === revert?.partID || revertPartFound) {
-            revertPartFound = true;
-            isPartActive = false;
-          }
-        }
-        const visibility: MessageVisibility = isPartActive ? 'visible' : 'inactive';
-        const pType = str(pData.type);
-        if (pType === 'text') {
-          const textVal = str(pData.text);
-          if (textVal === null) continue;
-          const uuid = `${sessionId}:m:${String(mIdx).padStart(6, '0')}:${encodeURIComponent(m.id)}:p:${encodeURIComponent(p.id)}:text`;
-          visibleCount += visibility === 'visible' ? 1 : 0;
-          records.push({
-            kind: 'message',
-            uuid,
-            session_id: sessionId,
-            type: 'user',
-            parent_uuid: previousMessageUuid,
-            timestamp: messageTimestamp,
-            role: 'user',
-            text: trunc(textVal),
-            content_type: 'text',
-            is_meta: 0,
-            visibility,
-            model: null,
-            is_sidechain: isSubagent ? 1 : 0,
-            agent_id: isSubagent ? sessionId : null,
-            input_tokens: null,
-            output_tokens: null,
-            cwd: session.directory ?? null,
-            skill: null,
-            source: name,
-          } satisfies MessageRecord);
-          previousMessageUuid = uuid;
-          userEmittedAny = true;
-        }
-      }
-
-      if (!userEmittedAny) {
-        const isReverted = isAfterRevert || (isAtRevert && revert?.partID === null);
-        const visibility: MessageVisibility = isReverted ? 'inactive' : 'visible';
-        const uuid = `${sessionId}:m:${String(mIdx).padStart(6, '0')}:${encodeURIComponent(m.id)}:msg`;
-        const userText = str(mData.text);
-        visibleCount += visibility === 'visible' ? 1 : 0;
-        records.push({
-          kind: 'message',
-          uuid,
-          session_id: sessionId,
-          type: 'user',
-          parent_uuid: previousMessageUuid,
-          timestamp: messageTimestamp,
-          role: 'user',
-          text: userText !== null ? trunc(userText) : null,
-          content_type: userText !== null ? 'text' : 'unknown',
-          is_meta: 0,
-          visibility,
-          model: null,
-          is_sidechain: isSubagent ? 1 : 0,
-          agent_id: isSubagent ? sessionId : null,
-          input_tokens: null,
-          output_tokens: null,
-          cwd: session.directory ?? null,
-          skill: null,
-          source: name,
-        } satisfies MessageRecord);
-        previousMessageUuid = uuid;
-      }
-      continue;
-    }
-
-    if (role === 'assistant') {
-      const model = parseModelRef(mData.modelID) ?? parseModelRef(mData.model) ?? parseModelRef(session.model) ?? null;
-      let hasStepTokens = false;
-      const assistantRecords: MessageRecord[] = [];
-      let currentStepRecords: MessageRecord[] = [];
-      let hasToolCall = false;
-
-      let revertPartFound = false;
-
-      for (let pIdx = 0; pIdx < mParts.length; pIdx++) {
-        const p = mParts[pIdx]!;
-        const pData = legacyPartData(p);
-
-        let isPartActive = true;
-        if (isAfterRevert) {
-          isPartActive = false;
-        } else if (isAtRevert) {
-          if (revert?.partID === null) {
-            isPartActive = false;
-          } else if (p.id === revert?.partID || revertPartFound) {
-            revertPartFound = true;
-            isPartActive = false;
-          }
-        }
-        const visibility: MessageVisibility = isPartActive ? 'visible' : 'inactive';
-        const pType = str(pData.type);
-
-        if (pType === 'step-start') {
-          currentStepRecords = [];
-        } else if (pType === 'text') {
-          const textVal = str(pData.text);
-          if (textVal === null) continue;
-          const uuid = `${sessionId}:m:${String(mIdx).padStart(6, '0')}:${encodeURIComponent(m.id)}:p:${encodeURIComponent(p.id)}:text`;
-          visibleCount += visibility === 'visible' ? 1 : 0;
-          const record: MessageRecord = {
-            kind: 'message',
-            uuid,
-            session_id: sessionId,
-            type: 'assistant',
-            parent_uuid: previousMessageUuid,
-            timestamp: messageTimestamp,
-            role: 'assistant',
-            text: trunc(textVal),
-            content_type: 'text',
-            is_meta: 0,
-            visibility,
-            model,
-            is_sidechain: isSubagent ? 1 : 0,
-            agent_id: isSubagent ? sessionId : null,
-            input_tokens: null,
-            output_tokens: null,
-            cwd: session.directory ?? null,
-            skill: null,
-            source: name,
-          };
-          assistantRecords.push(record);
-          currentStepRecords.push(record);
-          records.push(record);
-          previousMessageUuid = uuid;
-        } else if (pType === 'reasoning') {
-          const thinkVal = str(pData.text);
-          if (thinkVal === null) continue;
-          const uuid = `${sessionId}:m:${String(mIdx).padStart(6, '0')}:${encodeURIComponent(m.id)}:p:${encodeURIComponent(p.id)}:think`;
-          visibleCount += visibility === 'visible' ? 1 : 0;
-          const record: MessageRecord = {
-            kind: 'message',
-            uuid,
-            session_id: sessionId,
-            type: 'assistant',
-            parent_uuid: previousMessageUuid,
-            timestamp: messageTimestamp,
-            role: 'assistant',
-            text: trunc(thinkVal),
-            content_type: 'thinking',
-            is_meta: 0,
-            visibility,
-            model,
-            is_sidechain: isSubagent ? 1 : 0,
-            agent_id: isSubagent ? sessionId : null,
-            input_tokens: null,
-            output_tokens: null,
-            cwd: session.directory ?? null,
-            skill: null,
-            source: name,
-          };
-          assistantRecords.push(record);
-          currentStepRecords.push(record);
-          records.push(record);
-          previousMessageUuid = uuid;
-        } else if (pType === 'tool') {
-          const callId = str(pData.callID);
-          const toolName = str(pData.tool);
-          if (callId === null || toolName === null) continue;
-          hasToolCall = true;
-
-          const uuid = `${sessionId}:m:${String(mIdx).padStart(6, '0')}:${encodeURIComponent(m.id)}:p:${encodeURIComponent(p.id)}:tool`;
-          const toolCallId = `${uuid}:call:${encodeURIComponent(callId)}`;
-          const state = isRecord(pData.state) ? pData.state : {};
-          const status = str(state.status);
-          const input = state.input ?? {};
-          const filePath = toolFilePath(toolName, input);
-
-          visibleCount += visibility === 'visible' ? 1 : 0;
-          const record: MessageRecord = {
-            kind: 'message',
-            uuid,
-            session_id: sessionId,
-            type: 'assistant',
-            parent_uuid: previousMessageUuid,
-            timestamp: messageTimestamp,
-            role: 'assistant',
-            text: null,
-            content_type: 'tool_use',
-            is_meta: 0,
-            visibility,
-            model,
-            is_sidechain: isSubagent ? 1 : 0,
-            agent_id: isSubagent ? sessionId : null,
-            input_tokens: null,
-            output_tokens: null,
-            cwd: session.directory ?? null,
-            skill: null,
-            source: name,
-          };
-          assistantRecords.push(record);
-          currentStepRecords.push(record);
-          previousMessageUuid = uuid;
-
-          records.push(record);
-          records.push({
-            kind: 'tool_call',
-            id: toolCallId,
-            message_uuid: uuid,
-            session_id: sessionId,
-            name: toolName,
-            presentation: 'default',
-            input_json: truncJson(input) ?? '{}',
-            file_path: filePath,
-          });
-
-          if (status === 'completed' || status === 'error') {
-            let contentStr = '';
-            const isError: 0 | 1 = status === 'error' ? 1 : 0;
-            if (status === 'error') {
-              contentStr = typeof state.error === 'string'
-                ? state.error
-                : JSON.stringify(state.error ?? '');
-            } else if (state.output !== undefined && state.output !== null) {
-              contentStr = typeof state.output === 'string'
-                ? state.output
-                : JSON.stringify(state.output);
-            }
-            records.push({
-              kind: 'tool_result',
-              tool_use_id: toolCallId,
-              message_uuid: uuid,
-              session_id: sessionId,
-              content: trunc(contentStr),
-              file_path: filePath,
-              is_error: isError,
-            });
-          }
-        } else if (pType === 'step-finish') {
-          const stepUsage = v1StepUsageTokens(pData.tokens);
-          if (stepUsage.input !== null || stepUsage.output !== null) {
-            hasStepTokens = true;
-            if (currentStepRecords.length > 0) {
-              const target = currentStepRecords.at(-1)!;
-              target.input_tokens = stepUsage.input;
-              target.output_tokens = stepUsage.output;
-            } else {
-              const uuid = `${sessionId}:m:${String(mIdx).padStart(6, '0')}:${encodeURIComponent(m.id)}:p:${encodeURIComponent(p.id)}:step`;
-              visibleCount += visibility === 'visible' ? 1 : 0;
-              const record: MessageRecord = {
-                kind: 'message',
-                uuid,
-                session_id: sessionId,
-                type: 'assistant',
-                parent_uuid: previousMessageUuid,
-                timestamp: messageTimestamp,
-                role: 'assistant',
-                text: null,
-                content_type: 'unknown',
-                is_meta: 0,
-                visibility,
-                model,
-                is_sidechain: isSubagent ? 1 : 0,
-                agent_id: isSubagent ? sessionId : null,
-                input_tokens: stepUsage.input,
-                output_tokens: stepUsage.output,
-                cwd: session.directory ?? null,
-                skill: null,
-                source: name,
-              };
-              assistantRecords.push(record);
-              currentStepRecords.push(record);
-              records.push(record);
-              previousMessageUuid = uuid;
-            }
-          }
-        }
-      }
-
-      // If no text/think/tool messages emitted, emit textless anchor
-      if (assistantRecords.length === 0) {
-        const uuid = `${sessionId}:m:${String(mIdx).padStart(6, '0')}:${encodeURIComponent(m.id)}:msg`;
-        const isReverted = isAfterRevert || (isAtRevert && revert?.partID === null);
-        const visibility: MessageVisibility = isReverted ? 'inactive' : 'visible';
-        visibleCount += visibility === 'visible' ? 1 : 0;
-        const record: MessageRecord = {
-          kind: 'message',
-          uuid,
-          session_id: sessionId,
-          type: 'assistant',
-          parent_uuid: previousMessageUuid,
-          timestamp: messageTimestamp,
-          role: 'assistant',
-          text: null,
-          content_type: hasToolCall ? 'tool_use' : 'unknown',
-          is_meta: 0,
-          visibility,
-          model,
-          is_sidechain: isSubagent ? 1 : 0,
-          agent_id: isSubagent ? sessionId : null,
-          input_tokens: null,
-          output_tokens: null,
-          cwd: session.directory ?? null,
-          skill: null,
-          source: name,
-        };
-        assistantRecords.push(record);
-        records.push(record);
-        previousMessageUuid = uuid;
-      }
-
-      // If no step-finish occurred, fallback to assistant.tokens
-      if (!hasStepTokens && assistantRecords.length > 0) {
-        const fallbackUsage = v1StepUsageTokens(mData.tokens);
-        const lastRecord = assistantRecords.at(-1)!;
-        lastRecord.input_tokens = fallbackUsage.input;
-        lastRecord.output_tokens = fallbackUsage.output;
-      }
-    }
-  }
-
-  if (isSubagent && session.parent_id !== null) {
-    records.push({
-      kind: 'subagent',
-      agent_id: sessionId,
-      session_id: opencodeSessionId(session.parent_id, meta.dbPath),
-      parent_tool_use_id: null,
-      agent_type: session.agent ?? null,
-      description: session.title ?? null,
-      duration_ms: null,
-      total_tokens: null,
-    } satisfies SubagentRecord);
-  }
-
-  records.push({
-    kind: 'session',
-    id: sessionId,
-    title: session.title ?? null,
-    project: projectSlugFromPath(normalizeObservedCwd(session.directory)),
-    started_at: startedAt,
-    ended_at: endedAt ?? timestampOfMs(session.time_updated ?? session.time_created),
-    git_branch: gitBranch,
-    version: session.version ?? null,
-    message_count: visibleCount,
-    countMode: 'total',
-    jsonl_path: unit.key,
-    source: name,
-  } satisfies SessionRecord);
-
-  for (const record of records) yield record;
-
-  return encodeCursor({
-    timeUpdated: session.time_updated ?? 0,
-    messageCount: messages.length,
-    fingerprint,
-  });
-}
-
 function* parse(
   unit: IndexUnit,
   _cursor: Cursor,
@@ -1755,10 +459,17 @@ function* parse(
     // Tombstone verification
     const db = openSource(meta.dbPath, opener);
     if (db === null) {
-      throw new Error(`opencode: session database is busy or unreadable during tombstone verification: ${meta.dbPath}`);
+      throw new RetryableSourceReadError(meta.dbPath, `opencode: session database is busy or unreadable during tombstone verification: ${meta.dbPath}`);
     }
     try {
+      sourceTables(db);
+      const tombstonePhysical = storePhysicalState(meta.dbPath);
+      db.exec('BEGIN');
       const tables = sourceTables(db);
+      if (tombstonePhysical.identity !== meta.store.identity
+        || transcriptSchema(db) !== meta.store.schema) {
+        throw new RetryableSourceReadError(meta.dbPath, 'opencode: source changed before tombstone verification');
+      }
       if (!tables.has('session_v2') && !tables.has('session')) {
         throw new Error(`opencode: session database has no recognized transcript tables during tombstone verification: ${meta.dbPath}`);
       }
@@ -1771,8 +482,12 @@ function* parse(
         exists = db.prepare('SELECT 1 FROM session WHERE id = ?').get(nativeId) !== undefined;
       }
       if (exists) {
-        throw new Error(`opencode: session still present during tombstone parse: ${unit.sessionId}`);
+        throw new RetryableSourceReadError(meta.dbPath, `opencode: session still present during tombstone parse: ${unit.sessionId}`);
       }
+      if (storePhysicalState(meta.dbPath).stamp !== tombstonePhysical.stamp) {
+        throw new RetryableSourceReadError(meta.dbPath, 'opencode: source changed during tombstone verification');
+      }
+      db.exec('COMMIT');
       return TOMBSTONE_CURSOR;
     } finally {
       db.close();
@@ -1781,28 +496,36 @@ function* parse(
 
   const db = openSource(meta.dbPath, opener);
   if (db === null) {
-    throw new Error(`opencode: session database is busy or unreadable: ${meta.dbPath}`);
+    throw new RetryableSourceReadError(meta.dbPath, `opencode: session database is busy or unreadable: ${meta.dbPath}`);
   }
 
   try {
+    sourceTables(db);
+    const physical = storePhysicalState(meta.dbPath);
     db.exec('BEGIN');
     try {
       const tables = sourceTables(db);
-      const entry = readSessionEntry(db, tables, meta.rawSessionId);
-      if (entry === undefined) {
-        throw new Error(`opencode: session vanished before parse: ${meta.rawSessionId}`);
+      const entry = observeSession(db, tables, meta.rawSessionId);
+      if (entry === undefined || entry.manifest !== meta.manifest
+        || transcriptSchema(db) !== meta.store.schema || physical.identity !== meta.store.identity
+        || physical.stamp !== meta.store.stamp) {
+        throw new RetryableSourceReadError(meta.dbPath, `opencode: source changed before parse: ${meta.rawSessionId}`);
       }
-      const { row: session, format } = entry;
-      const verifiedIsSubagent = checkIsSubagent(db, session.parent_id, tables);
-      if (verifiedIsSubagent !== (unit.isSubagent === true)) {
-        throw new Error(`opencode: session parent classification changed during parse: ${session.id}`);
+      const generator = entry.format === 'v2'
+        ? parseV2(unit, meta, db, entry.row) : parseV1(unit, meta, db, entry.row);
+      const records: TranscriptRecord[] = [];
+      let step = generator.next();
+      while (!step.done) { records.push(step.value); step = generator.next(); }
+      if (storePhysicalState(meta.dbPath).stamp !== meta.store.stamp) {
+        throw new RetryableSourceReadError(meta.dbPath, `opencode: source changed during parse: ${meta.rawSessionId}`);
       }
-
-      if (format === 'v2') {
-        return yield* parseV2(unit, meta, db, session);
-      } else {
-        return yield* parseV1(unit, meta, db, session);
+      if (meta.reconcileFingerprint === undefined || meta.reconcileFingerprint !== step.value) {
+        if (meta.reconcileFingerprint !== undefined) yield { kind: 'delete-session', sessionId: unit.sessionId };
+        yield* records;
       }
+      return encodeCursor(entry.row.time_updated ?? 0, {
+        manifest: entry.manifest, recovery: meta.recovery, store: meta.store, fingerprint: step.value,
+      });
     } finally {
       db.exec('COMMIT');
     }
@@ -1848,17 +571,14 @@ function raw(input: RawLookup, opener: OpencodeDatabaseOpener): RawRecord | null
 
       // Verify cursor if supplied
       if (input.cursor !== undefined && input.cursor !== null) {
-        let calculatedCursor: string;
+        const state = decodeCursor(input.cursor);
+        if (state === null) return null;
+        let fingerprint: string;
         if (sessionFormat === 'v2') {
           const msgs = db.prepare(
             'SELECT id, session_id, type, seq, time_created, time_updated, data FROM session_message WHERE session_id = ? ORDER BY seq, time_created, id',
           ).all(rawSessionId) as unknown as SessionMessageRow[];
-          const fp = fingerprintSession('v2', sessionRow, isSubagent, msgs);
-          calculatedCursor = encodeCursor({
-            timeUpdated: sessionRow.time_updated ?? 0,
-            messageCount: msgs.length,
-            fingerprint: fp,
-          });
+          fingerprint = fingerprintSession('v2', sessionRow, isSubagent, msgs);
         } else {
           const msgs = db.prepare(
             'SELECT id, session_id, time_created, time_updated, data FROM message WHERE session_id = ? ORDER BY time_created, id',
@@ -1866,16 +586,9 @@ function raw(input: RawLookup, opener: OpencodeDatabaseOpener): RawRecord | null
           const parts = db.prepare(
             'SELECT id, message_id, session_id, time_created, time_updated, data FROM part WHERE session_id = ? ORDER BY id',
           ).all(rawSessionId) as unknown as PartRow[];
-          const fp = fingerprintSession('v1', sessionRow, isSubagent, undefined, msgs, parts);
-          calculatedCursor = encodeCursor({
-            timeUpdated: sessionRow.time_updated ?? 0,
-            messageCount: msgs.length,
-            fingerprint: fp,
-          });
+          fingerprint = fingerprintSession('v1', sessionRow, isSubagent, undefined, msgs, parts);
         }
-        if (input.cursor !== calculatedCursor) {
-          return null;
-        }
+        if (fingerprint !== state.fingerprint) return null;
       }
 
       let projection: Record<string, unknown> | null = null;

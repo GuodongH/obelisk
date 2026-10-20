@@ -1,6 +1,7 @@
 // Copyright (C) 2026 tommy0103 and contributors.
 // SPDX-License-Identifier: AGPL-3.0-only
 
+import { RetryableSourceReadError } from '../../../packages/core/src/providers/source-read-error.ts';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -470,6 +471,9 @@ function buildIndex({
             });
           }
           if (error instanceof ProviderIndexFailure) {
+            if (error.sourceError instanceof RetryableSourceReadError) {
+              inventoryIssues.push({ provider: error.item.provider.name, path: error.sourceError.sourcePath, error: error.sourceError.message });
+            }
             skipped.push({
               provider: error.item.provider.name,
               path: error.item.unit.key,
@@ -521,6 +525,9 @@ function buildIndex({
         onError: (error, { provider, unit }) => {
           if (isBeginBusyFailure(error)) return 'stop';
           if (hasUnusableTransaction(error)) throw error;
+          if (error instanceof RetryableSourceReadError) {
+            inventoryIssues.push({ provider: provider.name, path: error.sourcePath, error: error.message });
+          }
           skipped.push({
             provider: provider.name,
             path: unit.key,

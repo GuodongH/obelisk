@@ -2003,3 +2003,171 @@ test('pre-split completed compaction is a summary in direct, SQLite and raw proj
     assert.equal(source.provider.raw({ source: 'opencode', session: { id: unit.sessionId, jsonl_path: unit.key }, messageUuid: summary.id }).messageText, 'completed summary');
   } finally { source.db.close(); idx.close(); }
 });
+
+function instrumentedProvider(source) {
+  const reads = { payloadRows: 0, payloadBytes: 0, metadataRows: 0, payloadSessions: new Set() };
+  const provider = createOpencodeProvider({ rootDir: source.dir, openDatabase: path => {
+    const db = openDb(path);
+    return { exec: sql => db.exec(sql), close: () => db.close(), prepare: sql => {
+      const stmt = db.prepare(sql);
+      const count = (rows, args) => {
+        for (const row of rows) {
+          if (typeof row.data === 'string') {
+            reads.payloadRows++; reads.payloadBytes += Buffer.byteLength(row.data);
+            reads.payloadSessions.add(row.session_id ?? args[0]);
+          } else reads.metadataRows++;
+        }
+        return rows;
+      };
+      return { run: (...args) => stmt.run(...args),
+        all: (...args) => count(stmt.all(...args), args),
+        get: (...args) => { const row = stmt.get(...args); count(row ? [row] : [], args); return row; } };
+    } };
+  } });
+  const reset = () => { reads.payloadRows = reads.payloadBytes = reads.metadataRows = 0; reads.payloadSessions.clear(); };
+  return { provider, reads, reset };
+}
+
+test('unchanged census reads zero payload; modern writes in mixed stores replay only affected history', () => {
+  for (const historySize of [10, 100]) {
+    const source = upstreamStore();
+    source.db.exec('BEGIN');
+    for (let i = 0; i < 20; i++) {
+      upstreamSession(source.db, `s${i}`);
+      source.db.prepare('INSERT INTO event_sequence VALUES (?,?,?)').run(`s${i}`, 1, 'owner');
+      for (let j = 0; j < (i === 0 ? 5 : historySize); j++) {
+        upstreamMessage(source.db, `s${i}`, `m${i}_${j}`, 'user', j, { text: 'synthetic '.repeat(50) });
+      }
+    }
+    upstreamSession(source.db, 'legacy');
+    source.db.prepare('INSERT INTO message VALUES (?,?,?,?,?)').run('lm', 'legacy', 1000, 1000, JSON.stringify({ role: 'user' }));
+    for (let j = 0; j < historySize; j++) source.db.prepare('INSERT INTO part VALUES (?,?,?,?,?,?)')
+      .run(`lp${j}`, 'lm', 'legacy', 1000, 1000, JSON.stringify({ type: 'text', text: 'legacy '.repeat(100) }));
+    source.db.exec('COMMIT');
+    const { provider, reads, reset } = instrumentedProvider(source);
+    const cursors = new Map();
+    const apply = () => {
+      const units = discover(provider, { cursors });
+      for (const unit of units) cursors.set(unit.key, drain(provider.parse(unit, cursors.get(unit.key) ?? null)).cursor);
+      return units;
+    };
+    try {
+      apply(); reset();
+      assert.equal(apply().length, 0);
+      assert.equal(reads.payloadRows, 0, 'unchanged history must not be read to prove it unchanged');
+      for (let update = 0; update < 3; update++) {
+        // Exact durable writer contract: head and projector commit together;
+        // timestamps and insertion seq intentionally stay at the same millisecond.
+        source.db.exec('BEGIN IMMEDIATE');
+        source.db.prepare('UPDATE session_message SET data=? WHERE id=?').run(JSON.stringify({ text: `update ${update}` }), 'm0_0');
+        source.db.prepare('UPDATE event_sequence SET seq=seq+1 WHERE aggregate_id=?').run('s0');
+        source.db.exec('COMMIT'); reset();
+        const units = apply();
+        assert.equal(units.length, 1);
+        assert.equal(units[0].sessionId, opencodeSessionId('s0', source.path));
+        assert.deepEqual([...reads.payloadSessions], ['s0']);
+        assert.equal(reads.payloadRows, 5, '10x unrelated history cannot increase changed-session payload reads');
+        reset(); assert.equal(apply().length, 0); assert.equal(reads.payloadRows, 0);
+      }
+      // New provider instance simulates worker/CLI restart: no connection-local cache.
+      const restarted = instrumentedProvider(source);
+      assert.equal(discover(restarted.provider, { cursors }).length, 0);
+      assert.equal(restarted.reads.payloadRows, 0);
+    } finally { source.db.close(); }
+  }
+});
+
+test('legacy import prefix discovers remaining parts without a header or head update', () => {
+  const source = upstreamStore(); upstreamSession(source.db, 's');
+  source.db.prepare('INSERT INTO message VALUES (?,?,?,?,?)').run('m', 's', 1000, 1000, JSON.stringify({ role: 'user' }));
+  source.db.prepare('INSERT INTO part VALUES (?,?,?,?,?,?)').run('p1', 'm', 's', 1000, 1000, JSON.stringify({ type: 'text', text: 'prefix' }));
+  const { provider, reads, reset } = instrumentedProvider(source);
+  const idx = indexFixture(provider);
+  try {
+    idx.run(); const header = source.db.prepare('SELECT * FROM session').get(); reset();
+    assert.equal(idx.run().plan.items.length, 0); assert.equal(reads.payloadRows, 0);
+    source.db.prepare('INSERT INTO part VALUES (?,?,?,?,?,?)').run('p2', 'm', 's', 1000, 1000, JSON.stringify({ type: 'text', text: 'remaining' }));
+    assert.deepEqual(source.db.prepare('SELECT * FROM session').get(), header);
+    assert.equal(idx.run().result.complete, true);
+    assert.deepEqual(idx.db.prepare('SELECT text FROM messages ORDER BY rowid').all().map(r => r.text), ['prefix', 'remaining']);
+    reset(); assert.equal(idx.run().plan.items.length, 0); assert.equal(reads.payloadRows, 0);
+  } finally { source.db.close(); idx.close(); }
+});
+
+test('unexplained-write reconciliation retries failed sessions independently after sibling commits and restart', () => {
+  const source = upstreamStore('v2.0.32');
+  for (const id of ['a', 'b', 'c']) {
+    upstreamSession(source.db, id, 'session_v2');
+    upstreamMessage(source.db, id, `m${id}`, 'user', 0, { text: `last-good ${id}` });
+    source.db.prepare('INSERT INTO event_sequence VALUES (?,?,?)').run(id, 1, 'owner');
+  }
+  const idx = indexFixture(source.provider);
+  const run = provider => indexProviderPlan({ db: idx.db,
+    plan: createProviderIndexPlan(idx.db, createProviderRegistry([provider])),
+    runTransaction: (_label, work) => runWriteTransaction(idx.db, work), onError: () => 'skip' });
+  try {
+    idx.run();
+    const key = opencodeUnitKey(source.path, 'b');
+    const oldCursor = idx.db.prepare('SELECT cursor FROM index_state WHERE jsonl_path=?').get(key).cursor;
+    source.db.prepare('UPDATE session_message SET data=? WHERE id=?').run('{', 'mb');
+    const first = run(source.provider);
+    assert.equal(first.committed.length, 2); assert.equal(first.failedItems.length, 1);
+    const restarted = createOpencodeProvider({ rootDir: source.dir, openDatabase: openDb });
+    assert.equal(run(restarted).failedItems.length, 1, 'a sibling cursor must not acknowledge the failed payload');
+    // An ordinary event-writer update must not erase outstanding recovery work.
+    source.db.exec('BEGIN IMMEDIATE');
+    source.db.prepare('UPDATE session_message SET data=? WHERE id=?').run(JSON.stringify({ text: 'updated c' }), 'mc');
+    source.db.prepare('UPDATE event_sequence SET seq=seq+1 WHERE aggregate_id=?').run('c'); source.db.exec('COMMIT');
+    assert.equal(run(restarted).failedItems.length, 1);
+    assert.equal(idx.db.prepare('SELECT cursor FROM index_state WHERE jsonl_path=?').get(key).cursor, oldCursor);
+    assert.ok(idx.db.prepare('SELECT 1 FROM messages WHERE text=?').get('last-good b'));
+    source.db.prepare('UPDATE session_message SET data=? WHERE id=?').run(JSON.stringify({ text: 'recovered b' }), 'mb');
+    assert.equal(run(restarted).complete, true);
+    assert.ok(idx.db.prepare('SELECT 1 FROM messages WHERE text=?').get('recovered b'));
+    assert.equal(run(restarted).committed.length, 0);
+  } finally { source.db.close(); idx.close(); }
+});
+
+test('WAL checkpoint reconciles once without retracting equal canonical records and old cursors replay once', () => {
+  const source = upstreamStore('v2.0.32'); source.db.exec('PRAGMA journal_mode=WAL');
+  upstreamSession(source.db, 's', 'session_v2'); upstreamMessage(source.db, 's', 'm', 'user', 0, { text: 'stable' });
+  source.db.prepare('INSERT INTO event_sequence VALUES (?,?,?)').run('s', 1, 'owner');
+  const idx = indexFixture(source.provider);
+  try {
+    idx.run(); const before = idx.db.prepare('SELECT * FROM messages').all();
+    source.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+    const checkpoint = idx.run();
+    assert.equal(checkpoint.result.complete, true);
+    assert.equal(checkpoint.plan.items[0].unit.meta.reason, 'unexplained-write');
+    assert.deepEqual(idx.db.prepare('SELECT * FROM messages').all(), before);
+    assert.equal(idx.run().plan.items.length, 0, 'checkpoint must not cause perpetual full scans');
+    const key = opencodeUnitKey(source.path, 's');
+    for (const old of ['1000:1:v1:old-fingerprint', '1000:1:future-manifest:opaque']) {
+      idx.db.prepare('UPDATE index_state SET cursor=? WHERE jsonl_path=?').run(old, key);
+      assert.equal(idx.run().plan.items.length, 1);
+      assert.equal(idx.run().plan.items.length, 0);
+      assert.deepEqual(idx.db.prepare('SELECT * FROM messages').all(), before);
+    }
+  } finally { source.db.close(); idx.close(); }
+});
+
+test('a source update between discovery and parse rolls back the unit and retries a fresh observation', () => {
+  const source = upstreamStore('v2.0.32'); upstreamSession(source.db, 's', 'session_v2');
+  upstreamMessage(source.db, 's', 'm', 'user', 0, { text: 'last-good' });
+  const idx = indexFixture(source.provider);
+  try {
+    idx.run(); const before = idx.db.prepare('SELECT * FROM index_state ORDER BY jsonl_path').all();
+    source.db.prepare('UPDATE session_message SET data=?').run(JSON.stringify({ text: 'intermediate' }));
+    const plan = createProviderIndexPlan(idx.db, createProviderRegistry([source.provider]));
+    source.db.prepare('UPDATE session_message SET data=?').run(JSON.stringify({ text: 'fresh' }));
+    const errors = [];
+    const result = indexProviderPlan({ db: idx.db, plan,
+      runTransaction: (_label, work) => runWriteTransaction(idx.db, work), onError: e => { errors.push(e); return 'skip'; } });
+    assert.equal(result.complete, false);
+    assert.equal(errors[0].name, 'RetryableSourceReadError'); assert.equal(errors[0].sourcePath, source.path);
+    assert.deepEqual(idx.db.prepare('SELECT * FROM index_state ORDER BY jsonl_path').all(), before);
+    assert.equal(idx.db.prepare('SELECT text FROM messages').get().text, 'last-good');
+    assert.equal(idx.run().result.complete, true);
+    assert.equal(idx.db.prepare('SELECT text FROM messages').get().text, 'fresh');
+  } finally { source.db.close(); idx.close(); }
+});

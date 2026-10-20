@@ -128,3 +128,43 @@ Two existing assertions necessarily follow the new representation: the tombstone
 now carries its real native ID and an explicit kind (instead of the empty-ID
 sentinel); the successful migration asserts literal marker v3 instead of v2.
 The literal old-marker fixture and all last-good/rollback assertions remain.
+
+### Incremental implementation
+
+The provider now has internal identity, decode, source-observation, manifest and
+projection modules. Metadata discovery uses indexed format probes, session headers,
+aggregate heads and compatibility member metadata; it never selects payload data.
+Pinned modern event writers avoid message-member scans. Legacy and unverified
+writers retain member metadata comparison. Changed sessions replay complete bodies.
+
+Each successful cursor stores the local manifest, body attestation, physical source
+identity/stamp, schema digest and recovery generation. Any cursor at the current
+stamp can explain a normal store observation; it does not acknowledge failed
+siblings. An unexplained physical write schedules per-session reconciliation;
+equal bodies update only cursors, while changed bodies replace their session.
+A monotonically increasing recovery generation carried by successful unit cursors
+keeps failed reconciliation units pending across partial commits and restart.
+No shared checkpoint or fake canonical session was needed. Related children replay
+when a parent can be retracted, preserving links removed by destination cascades.
+
+Read-only WAL initialization occurs before sampling the physical files; sampling
+then brackets the SQLite snapshot. Parse checks the discovered manifest/schema/
+physical observation and buffers projection before publishing. Instability uses a
+provider-neutral RetryableSourceReadError; both indexers feed it into the existing
+bounded inventory retry path, including strict rebuild failures.
+
+The fallback is deliberately conservative: checkpoints, WAL replacement or an
+unexplained data-only edit can schedule a full payload reconciliation. Normal
+verified head updates in mixed stores do not do so. Metadata is not CDC: concurrent
+out-of-contract SQL edits concealed by another session's legitimate metadata/head
+update are not attested. Filesystem timestamp/identity guarantees still apply.
+Sorting and indexed metadata probes add their ordinary comparison/lookup costs;
+the stated O(A + S + C log N + B_changed) model omits sorting constants and applies
+to payload work, not a claim of zero source-page IO or message-level O(delta).
+
+Focused integration: 83 passed (provider, app indexing, service and watcher filter),
+root/app typecheck: zero errors. Corrected performance regressions were also run
+against commit 27ef497 and failed on actual full payload reads, then passed with
+this implementation. The 10x-unrelated-history case reads 5 affected payload rows
+per modern update, with zero unchanged payload reads, including cold provider
+reconstruction. Final broader verification remains pending.

@@ -549,3 +549,29 @@ test('force rebuild keeps legacy providers without inventory certification compa
   assert.equal(afterDb.prepare('SELECT COUNT(*) AS c FROM index_state WHERE jsonl_path=?').get(marker).c, 1);
   afterDb.close();
 });
+
+test('desktop worker exposes transient provider reads to the existing inventory retry path', async () => {
+  const { RetryableSourceReadError } = await import('../packages/core/src/providers/source-read-error.ts');
+  class TransactionDatabase extends TestDatabase { get inTransaction() { return this.db.isTransaction; } }
+  const home = makeTempDir('obelisk-provider-read-retry-'); let unstable = true;
+  const registry = createProviderRegistry([{
+    name: 'alpha', descriptor: { id: 'alpha', name: 'Alpha', vendor: 'Test', defaultRoot: home, color: '#123456' },
+    watchTargets: () => [], raw: () => null,
+    discover: ctx => ctx.lastCursor('alpha:unit') ? [] : [{ key: 'alpha:unit', sessionId: 'alpha:session' }],
+    *parse(unit) {
+      if (unstable) throw new RetryableSourceReadError(home, 'source changed before parse');
+      yield { kind: 'session', id: unit.sessionId, title: 'recovered', project: null, started_at: null, ended_at: null, git_branch: null, version: null, message_count: 0, countMode: 'total', jsonl_path: unit.key, source: 'alpha' };
+      return '10:0';
+    },
+  }]);
+  const options = { providerRegistry: registry, providerRoots: { alpha: home },
+    claudeDir: join(home, 'empty-claude'), codexDir: join(home, 'empty-codex'),
+    dbPath: join(home, 'index.sqlite'), DatabaseImpl: TransactionDatabase };
+  const failed = buildIndex(options);
+  assert.equal(failed.complete, false);
+  assert.deepEqual(failed.inventoryIssues, [{ provider: 'alpha', path: home, error: 'source changed before parse' }]);
+  unstable = false;
+  const retry = buildIndex(options);
+  assert.equal(retry.complete, true); assert.deepEqual(retry.inventoryIssues, []);
+  assert.equal(buildIndex(options).files, 0);
+});
