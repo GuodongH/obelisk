@@ -114,3 +114,17 @@ Record legacy metadata cost separately. Timings supplement operation counts.
 
 Pending. Record commit phases, deviations with reasons, final verification and
 remaining limitations here as implementation proceeds.
+
+### Correctness phase
+
+Identity and decoding regressions were first run against the previous code: all
+four failed for the reported behavior. Centralized the byte-compatible identity
+codec, introduced explicit authenticated tombstone metadata, fixed shared watcher
+union semantics and shared native payload decoding between projection and raw.
+Pre-split completed compaction now projects to summaries; canonical marker is v3.
+Targeted provider/watcher suites: 44 passed; root/app typecheck: zero errors.
+
+Two existing assertions necessarily follow the new representation: the tombstone
+now carries its real native ID and an explicit kind (instead of the empty-ID
+sentinel); the successful migration asserts literal marker v3 instead of v2.
+The literal old-marker fixture and all last-good/rollback assertions remain.

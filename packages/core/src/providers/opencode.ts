@@ -25,6 +25,12 @@ import { existsSync, readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, normalize, sep } from 'node:path';
 
+import { isRecord, parseJson, transcriptObject, modernMessageData, legacyMessageData, legacyPartData, str, parseModelRef, completedCompaction } from './opencode-decode.ts';
+export { parseModelRef } from './opencode-decode.ts';
+
+import { decodeOpencodeUnitKey, opencodeSessionId, opencodeUnitKey } from './opencode-identity.ts';
+export { opencodeStoreHash, opencodeSessionId, opencodeUnitKey } from './opencode-identity.ts';
+
 import { normalizeObservedCwd, projectSlugFromPath, trunc, truncJson } from '../parsing.ts';
 import type { SqliteDb } from '../sqlite-types.ts';
 import type {
@@ -44,99 +50,11 @@ import type {
 } from './types.ts';
 
 export const name = 'opencode';
-export const OPENCODE_CANONICAL_TRANSCRIPT_MARKER = '__opencode_canonical_transcript_v2__';
+export const OPENCODE_CANONICAL_TRANSCRIPT_MARKER = '__opencode_canonical_transcript_v3__';
 
 const TOMBSTONE_CURSOR = '0:0:v1:tombstone';
 
 export type OpencodeDatabaseOpener = (dbPath: string) => SqliteDb;
-
-type JsonRecord = Record<string, unknown>;
-
-function isRecord(value: unknown): value is JsonRecord {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-function parseJson(text: unknown): JsonRecord | null {
-  if (typeof text !== 'string' || text.length === 0) return null;
-  try {
-    const value: unknown = JSON.parse(text);
-    return isRecord(value) ? value : null;
-  } catch {
-    return null;
-  }
-}
-
-function transcriptObject(text: unknown, location: string): JsonRecord {
-  const value = parseJson(text);
-  if (value === null) throw new Error(`opencode: invalid JSON payload at ${location}`);
-  return value;
-}
-
-function modernMessageData(message: SessionMessageRow): JsonRecord {
-  const data = transcriptObject(message.data, `session_message ${message.id}`);
-  if (message.type === 'user' && typeof data.text !== 'string') {
-    throw new Error(`opencode: invalid user payload at session_message ${message.id}`);
-  }
-  if (message.type === 'assistant') {
-    if (!Array.isArray(data.content) || data.content.some(item => !isRecord(item)
-      || typeof item.type !== 'string'
-      || ((item.type === 'text' || item.type === 'reasoning') && typeof item.text !== 'string')
-      || (item.type === 'tool' && (str(item.id) === null || str(item.name) === null
-        || !isRecord(item.state) || typeof item.state.status !== 'string')))) {
-      throw new Error(`opencode: invalid assistant payload at session_message ${message.id}`);
-    }
-  }
-  // The pre-split writer records callID/output/time, with no status or exit.
-  const preSplitShell = data.status === undefined && typeof data.callID === 'string'
-    && typeof data.output === 'string' && isRecord(data.time) && typeof data.time.created === 'number';
-  if (message.type === 'shell' && (typeof data.command !== 'string' || (!preSplitShell && typeof data.status !== 'string')
-    || (data.exit !== undefined && (typeof data.exit !== 'number' || !Number.isFinite(data.exit)))
-    || (data.output !== undefined && typeof data.output !== 'string'
-      && (!isRecord(data.output) || typeof data.output.output !== 'string')))) {
-    throw new Error(`opencode: invalid shell payload at session_message ${message.id}`);
-  }
-  return data;
-}
-
-function legacyMessageData(message: MessageRow): JsonRecord {
-  const data = transcriptObject(message.data, `message ${message.id}`);
-  if (data.role !== 'user' && data.role !== 'assistant') {
-    throw new Error(`opencode: invalid role payload at message ${message.id}`);
-  }
-  return data;
-}
-
-function legacyPartData(part: PartRow): JsonRecord {
-  const data = transcriptObject(part.data, `part ${part.id}`);
-  if (typeof data.type !== 'string'
-    || ((data.type === 'text' || data.type === 'reasoning') && typeof data.text !== 'string')) {
-    throw new Error(`opencode: invalid part payload at part ${part.id}`);
-  }
-  return data;
-}
-
-function str(value: unknown): string | null {
-  return typeof value === 'string' && value.length > 0 ? value : null;
-}
-
-export function parseModelRef(value: unknown): string | null {
-  if (typeof value === 'string' && value.length > 0) {
-    const parsed = parseJson(value);
-    if (parsed && typeof parsed.id === 'string' && parsed.id.length > 0) {
-      return parsed.id;
-    }
-    return value;
-  }
-  if (isRecord(value)) {
-    if (typeof value.id === 'string' && value.id.length > 0) {
-      return value.id;
-    }
-    if (typeof value.modelID === 'string' && value.modelID.length > 0) {
-      return value.modelID;
-    }
-  }
-  return null;
-}
 
 function checkIsSubagent(db: SqliteDb, parentId: string | null, tables: ReadonlySet<string>): boolean {
   if (parentId === null || parentId.length === 0) return false;
@@ -175,18 +93,6 @@ export function resolveOpencodeRoot(
     return { rootDir: dirname(storePath), singleDbFile: storePath };
   }
   return { rootDir: defaultOpencodeDataRoot(homeDir) };
-}
-
-export function opencodeStoreHash(storePath: string): string {
-  return createHash('sha256').update(`opencode-store-v1\0${normalize(storePath)}`).digest('hex');
-}
-
-export function opencodeSessionId(nativeId: string, storePath: string): string {
-  return `opencode:${encodeURIComponent(nativeId)}:${opencodeStoreHash(storePath)}`;
-}
-
-export function opencodeUnitKey(storePath: string, nativeId: string): string {
-  return `${normalize(storePath)}#ses:${encodeURIComponent(nativeId)}`;
 }
 
 function openSource(dbPath: string, opener: OpencodeDatabaseOpener): SqliteDb | null {
@@ -231,9 +137,9 @@ function collectPriorStoresInDir(dir: string, ctx: DiscoverContext): string[] {
   const indexedSessions = ctx.indexedSessions?.() ?? [];
   const stores = new Set<string>();
   for (const s of indexedSessions) {
-    const hashIdx = s.jsonlPath.indexOf('#ses:');
-    if (hashIdx !== -1) {
-      const store = normalize(s.jsonlPath.slice(0, hashIdx));
+    const identity = decodeOpencodeUnitKey(s.jsonlPath);
+    if (identity !== null) {
+      const store = identity.dbPath;
       if (store.startsWith(prefix) || store === join(normDir, 'opencode.db')) {
         stores.add(store);
       }
@@ -385,12 +291,19 @@ function decodeCursor(cursor: Cursor): CursorState | null {
   return { timeUpdated, messageCount, fingerprint: parts[3]! };
 }
 
-interface OpencodeUnitMeta {
+interface OpencodeSessionMeta {
   kind: 'opencode-session';
   format: 'v1' | 'v2';
   dbPath: string;
   rawSessionId: string;
 }
+
+interface OpencodeTombstoneMeta {
+  kind: 'opencode-tombstone';
+  dbPath: string;
+  rawSessionId: string;
+}
+type OpencodeUnitMeta = OpencodeSessionMeta | OpencodeTombstoneMeta;
 
 const FILE_TOOLS = new Set(['read', 'edit', 'write', 'apply_patch', 'patch']);
 
@@ -661,7 +574,9 @@ function discoverAtStore(
 
       // Tombstones for deleted sessions in this store
       for (const indexed of indexedSessions) {
-        if (!indexed.jsonlPath.startsWith(`${normalize(dbPath)}#ses:`)) continue;
+        const identity = decodeOpencodeUnitKey(indexed.jsonlPath);
+        if (identity === null || identity.dbPath !== normalize(dbPath)
+          || opencodeSessionId(identity.nativeId, dbPath) !== indexed.sessionId) continue;
         if (liveSessionIds.has(indexed.sessionId)) continue;
         if (liveUnitKeys.has(indexed.jsonlPath)) continue;
         units.push({
@@ -669,10 +584,9 @@ function discoverAtStore(
           sessionId: indexed.sessionId,
           retractSessionIds: [indexed.sessionId],
           meta: {
-            kind: 'opencode-session',
-            format: 'v2',
+            kind: 'opencode-tombstone',
             dbPath,
-            rawSessionId: '',
+            rawSessionId: identity.nativeId,
           } satisfies OpencodeUnitMeta,
         });
       }
@@ -789,7 +703,7 @@ function discoverAll(
 
 function* parseV2(
   unit: IndexUnit,
-  meta: OpencodeUnitMeta,
+  meta: OpencodeSessionMeta,
   db: SqliteDb,
   session: SessionRow,
 ): Generator<TranscriptRecord, Cursor> {
@@ -830,9 +744,8 @@ function* parseV2(
     }
 
     if (m.type === 'compaction') {
-      const status = str(data.status);
-      const summaryText = str(data.summary);
-      if (status === 'completed' && summaryText !== null) {
+      const summaryText = completedCompaction(data);
+      if (summaryText !== null) {
         const usage = v2UsageTokens(data.tokens);
         records.push({
           kind: 'summary',
@@ -1403,7 +1316,7 @@ function* parseV2(
 
 function* parseV1(
   unit: IndexUnit,
-  meta: OpencodeUnitMeta,
+  meta: OpencodeSessionMeta,
   db: SqliteDb,
   session: SessionRow,
 ): Generator<TranscriptRecord, Cursor> {
@@ -1827,11 +1740,18 @@ function* parse(
   opener: OpencodeDatabaseOpener,
 ): Generator<TranscriptRecord, Cursor> {
   const meta = unit.meta as OpencodeUnitMeta;
-  if (!meta || meta.kind !== 'opencode-session') {
+  if (!meta || (meta.kind !== 'opencode-session' && meta.kind !== 'opencode-tombstone')) {
     throw new Error('opencode: invalid unit metadata');
   }
 
-  if (meta.rawSessionId === '') {
+  const identity = decodeOpencodeUnitKey(unit.key);
+  if (identity === null || identity.dbPath !== normalize(meta.dbPath)
+    || identity.nativeId !== meta.rawSessionId
+    || opencodeSessionId(identity.nativeId, identity.dbPath) !== unit.sessionId) {
+    throw new Error('opencode: unit identity does not match metadata');
+  }
+
+  if (meta.kind === 'opencode-tombstone') {
     // Tombstone verification
     const db = openSource(meta.dbPath, opener);
     if (db === null) {
@@ -1842,13 +1762,7 @@ function* parse(
       if (!tables.has('session_v2') && !tables.has('session')) {
         throw new Error(`opencode: session database has no recognized transcript tables during tombstone verification: ${meta.dbPath}`);
       }
-      const hashIndex = unit.key.indexOf('#ses:');
-      const nativeId = hashIndex !== -1
-        ? decodeURIComponent(unit.key.slice(hashIndex + 5))
-        : decodeURIComponent(unit.sessionId.split(':')[1] ?? '');
-      if (!nativeId) {
-        throw new Error(`opencode: could not determine native session ID for tombstone: ${unit.key}`);
-      }
+      const nativeId = meta.rawSessionId;
       let exists = false;
       if (tables.has('session_v2')) {
         exists = db.prepare('SELECT 1 FROM session_v2 WHERE id = ?').get(nativeId) !== undefined;
@@ -1904,10 +1818,9 @@ function raw(input: RawLookup, opener: OpencodeDatabaseOpener): RawRecord | null
     : null;
   if (jsonlPath === null) return null;
 
-  const hashIndex = jsonlPath.indexOf('#ses:');
-  if (hashIndex === -1) return null;
-  const dbPath = jsonlPath.slice(0, hashIndex);
-  const rawSessionId = decodeURIComponent(jsonlPath.slice(hashIndex + 5));
+  const identity = decodeOpencodeUnitKey(jsonlPath);
+  if (identity === null) return null;
+  const { dbPath, nativeId: rawSessionId } = identity;
 
   // Store & Session identity strict authentication
   const expectedSessionId = opencodeSessionId(rawSessionId, dbPath);
@@ -1976,7 +1889,7 @@ function raw(input: RawLookup, opener: OpencodeDatabaseOpener): RawRecord | null
           ).get(rawSessionId, rawMsgId) as unknown as SessionMessageRow | undefined;
           if (!row || row.type !== 'compaction') return null;
           const parsedData = modernMessageData(row);
-          if (str(parsedData.status) !== 'completed' || str(parsedData.summary) === null) return null;
+          if (completedCompaction(parsedData) === null) return null;
           projection = {
             format: 'v2',
             message: {
@@ -1989,7 +1902,7 @@ function raw(input: RawLookup, opener: OpencodeDatabaseOpener): RawRecord | null
               data: parsedData,
             },
           };
-          messageText = str(parsedData.summary);
+          messageText = completedCompaction(parsedData);
         } else {
           // Format: m:(\d{6}):([^:]+)(:msg|:c:(\d{4}):(text|think|tool))
           const match = /^m:(\d{6}):([^:]+)(.*)$/.exec(suffix);
@@ -2199,9 +2112,9 @@ export function createOpencodeProvider({
     indexVersionMarker: OPENCODE_CANONICAL_TRANSCRIPT_MARKER,
     sessionUnitKey: (session) => session.jsonlPath,
     watchHints: (unitKey) => {
-      const delimiter = unitKey.lastIndexOf('#ses:');
-      if (delimiter < 1) return [];
-      const store = unitKey.slice(0, delimiter);
+      const identity = decodeOpencodeUnitKey(unitKey);
+      if (identity === null) return [];
+      const store = identity.dbPath;
       if (resolvedRoot === undefined && process.env.OPENCODE_DB?.trim() === ':memory:') return [];
       const scope = resolveOpencodeRoot(resolvedRoot, homeDir);
       if (scope.singleDbFile !== undefined

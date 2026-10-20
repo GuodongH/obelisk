@@ -249,3 +249,33 @@ test('caller routes OpenCode dynamic channel databases without synchronous direc
     mock.reset();
   }
 });
+
+test('merged OpenCode predicate preserves Hermes profile database names', async () => {
+  const { createProviderRegistry } = await import('../packages/core/src/providers/registry.ts');
+  const { createHermesProvider } = await import('../packages/core/src/providers/hermes.ts');
+  const { createOpencodeProvider } = await import('../packages/core/src/providers/opencode.ts');
+  let captured;
+  const ctx = mock.module(WATCHER_URL, { namedExports: { createAdaptiveWatcher: opts => {
+    captured = opts; return { stop() {}, ready: Promise.resolve() };
+  } } });
+  try {
+    const { createIndexerService } = await import(`../app/src/main/indexer-service.ts?merged=${Date.now()}`);
+    const root = mkdtempSync(join(tmpdir(), 'obelisk-merged-watch-'));
+    const profiles = join(root, 'profiles');
+    mkdirSync(join(profiles, 'coder'), { recursive: true });
+    const wal = join(profiles, 'coder', 'state.db-wal'); writeFileSync(wal, '');
+    const targets = createProviderRegistry([
+      createHermesProvider({ rootDir: root }), createOpencodeProvider({ rootDir: profiles }),
+    ]).watchTargets();
+    const timers = manualTimers(); const builds = [];
+    const service = createIndexerService({ watchTargets: targets, stabilityMs: 0, timers,
+      writeHeartbeat() {}, buildIndex: async args => builds.push(args) });
+    try {
+      service.start({ buildOnStart: false });
+      assert.equal(captured.shouldPromote(wal), true);
+      captured.onInvalidate({ type: 'paths', paths: [wal] }); timers.flush();
+      await new Promise(resolve => setImmediate(resolve));
+      assert.deepEqual(builds.map(b => b.changedPaths), [[wal]]);
+    } finally { service.stop(); }
+  } finally { ctx.restore(); mock.reset(); }
+});

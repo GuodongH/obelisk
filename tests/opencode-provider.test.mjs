@@ -1202,7 +1202,8 @@ test('P1-1: tombstone verification throws on missing/busy source DB and rolls ba
   const plan = createProviderIndexPlan(idx.db, createProviderRegistry([provider]));
   assert.equal(plan.items.length, 1);
   const tombUnit = plan.items[0].unit;
-  assert.equal(tombUnit.meta.rawSessionId, '');
+  assert.equal(tombUnit.meta.kind, 'opencode-tombstone');
+  assert.equal(tombUnit.meta.rawSessionId, 'ses_tomb_1');
 
   // 3a. Case A: source DB renamed offline before parse executes
   renameSync(dbPath, join(dir, 'opencode.offline.db'));
@@ -1881,14 +1882,14 @@ test('review regression: marker upgrade repairs existing canonical rows atomical
     assert.throws(() => idx.run(), /invalid JSON payload/);
     assert.deepEqual(idx.db.prepare('SELECT * FROM messages').all(), before);
     assert.equal(idx.db.prepare('SELECT cursor FROM index_state WHERE jsonl_path=?').get(key).cursor, '1000:0:v1:old-empty-fingerprint');
-    assert.equal(idx.db.prepare('SELECT 1 FROM index_state WHERE jsonl_path=?').get('__opencode_canonical_transcript_v2__'), undefined);
+    assert.equal(idx.db.prepare('SELECT 1 FROM index_state WHERE jsonl_path=?').get('__opencode_canonical_transcript_v3__'), undefined);
     db.prepare('UPDATE session_message SET data=?').run(JSON.stringify({ text: 'native modern prompt' }));
     const replay = idx.run();
     assert.equal(replay.result.complete, true);
     assert.ok(replay.plan.replayKeys.has('opencode'));
     assert.equal(idx.db.prepare('SELECT text FROM messages').get().text, 'native modern prompt');
     assert.equal(idx.db.prepare('SELECT COUNT(*) AS n FROM messages').get().n, 1);
-    assert.ok(idx.db.prepare('SELECT 1 FROM index_state WHERE jsonl_path=?').get('__opencode_canonical_transcript_v2__'));
+    assert.ok(idx.db.prepare('SELECT 1 FROM index_state WHERE jsonl_path=?').get('__opencode_canonical_transcript_v3__'));
     assert.equal(idx.run().plan.items.length, 0, 'the upgrade converges rather than replaying forever');
   } finally { db.close(); idx.close(); }
 });
@@ -1929,4 +1930,76 @@ test('review regression: hundreds of newer sessions in one channel do not hide a
     idx.db.exec('BEGIN IMMEDIATE; ROLLBACK');
     assert.equal(idx.run().result.complete, true);
   } finally { first.db.close(); second.db.close(); idx.close(); }
+});
+
+test('delimiter-bearing paths authenticate raw lookup and reject restored tombstones', () => {
+  const dir = join(makeTempDir('opencode-identity-'), 'data#ses:archive');
+  mkdirSync(dir);
+  const source = upstreamStore('v2.0.32', 'opencode.db', dir);
+  const insert = () => {
+    upstreamSession(source.db, 's:#ses:%', 'session_v2');
+    upstreamMessage(source.db, 's:#ses:%', 'm', 'user', 1, { text: 'last-good' });
+  };
+  insert();
+  const idx = indexFixture(source.provider);
+  try {
+    idx.run();
+    const session = idx.db.prepare('SELECT * FROM sessions').get();
+    const message = idx.db.prepare('SELECT uuid FROM messages').get();
+    assert.equal(source.provider.raw({ source: 'opencode', session, messageUuid: message.uuid }).messageText, 'last-good');
+    source.db.prepare('DELETE FROM session_v2').run();
+    const plan = createProviderIndexPlan(idx.db, createProviderRegistry([source.provider]));
+    assert.equal(plan.items.length, 1);
+    insert();
+    const result = indexProviderPlan({ db: idx.db, plan,
+      runTransaction: (_label, work) => runWriteTransaction(idx.db, work), onError: () => 'skip' });
+    assert.equal(result.complete, false);
+    assert.equal(idx.db.prepare('SELECT count(*) n FROM messages').get().n, 1);
+    assert.deepEqual(source.provider.watchHints(session.jsonl_path), [source.path, `${source.path}-wal`]);
+  } finally { source.db.close(); idx.close(); }
+});
+
+test('damaged required legacy tool fields preserve last-good tools and cursor until recovery', () => {
+  for (const field of ['callID', 'tool', 'state']) {
+    const source = upstreamStore();
+    upstreamSession(source.db, 's');
+    source.db.prepare('INSERT INTO message VALUES (?,?,?,?,?)').run('m', 's', 1000, 1000, JSON.stringify({ role: 'assistant' }));
+    const tool = { type: 'tool', callID: 'call', tool: 'read', state: {
+      status: 'completed', input: {}, output: 'last-good', title: 'synthetic', metadata: {}, time: { start: 1000, end: 1001 },
+    } };
+    source.db.prepare('INSERT INTO part VALUES (?,?,?,?,?,?)').run('p', 'm', 's', 1000, 1000, JSON.stringify(tool));
+    const idx = indexFixture(source.provider);
+    try {
+      idx.run();
+      const cursors = idx.db.prepare('SELECT * FROM index_state ORDER BY jsonl_path').all();
+      const damaged = { ...tool }; delete damaged[field];
+      source.db.prepare('UPDATE part SET data=?').run(JSON.stringify(damaged));
+      const result = indexProviderPlan({ db: idx.db,
+        plan: createProviderIndexPlan(idx.db, createProviderRegistry([source.provider])),
+        runTransaction: (_label, work) => runWriteTransaction(idx.db, work), onError: () => 'skip' });
+      assert.equal(result.complete, false, field);
+      assert.equal(idx.db.prepare('SELECT count(*) n FROM tool_calls').get().n, 1);
+      assert.deepEqual(idx.db.prepare('SELECT * FROM index_state ORDER BY jsonl_path').all(), cursors);
+      source.db.prepare('UPDATE part SET data=?').run(JSON.stringify(tool));
+      assert.equal(idx.run().result.complete, true);
+    } finally { source.db.close(); idx.close(); }
+  }
+});
+
+test('pre-split completed compaction is a summary in direct, SQLite and raw projections', () => {
+  const source = upstreamStore();
+  upstreamSession(source.db, 's');
+  upstreamMessage(source.db, 's', 'm', 'compaction', 1, {
+    reason: 'auto', summary: 'completed summary', recent: 'synthetic tail', time: { created: 1000 },
+  });
+  const idx = indexFixture(source.provider);
+  try {
+    const unit = discover(source.provider)[0];
+    const records = [...source.provider.parse(unit, null)];
+    assert.equal(records.find(r => r.kind === 'summary')?.content, 'completed summary');
+    idx.run();
+    const summary = idx.db.prepare('SELECT * FROM summaries').get();
+    assert.equal(summary.content, 'completed summary');
+    assert.equal(source.provider.raw({ source: 'opencode', session: { id: unit.sessionId, jsonl_path: unit.key }, messageUuid: summary.id }).messageText, 'completed summary');
+  } finally { source.db.close(); idx.close(); }
 });
