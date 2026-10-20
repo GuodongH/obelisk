@@ -4,7 +4,7 @@
 // OpenCode provider adapter in Core (see docs/adr/0001, ADR-0006, ADR-0007).
 //
 // Pure: discovers OpenCode SQLite stores (V1 session/message/part and V2
-// session_v2/session_message) and parses sessions into canonical records. It never
+// session[_v2]/session_message) and parses sessions into canonical records. It never
 // writes source databases. SQLite opening is injected because Core runs under both
 // node:sqlite (CLI) and better-sqlite3 (Electron).
 //
@@ -44,7 +44,7 @@ import type {
 } from './types.ts';
 
 export const name = 'opencode';
-export const OPENCODE_CANONICAL_TRANSCRIPT_MARKER = '__opencode_canonical_transcript_v1__';
+export const OPENCODE_CANONICAL_TRANSCRIPT_MARKER = '__opencode_canonical_transcript_v2__';
 
 const TOMBSTONE_CURSOR = '0:0:v1:tombstone';
 
@@ -64,6 +64,55 @@ function parseJson(text: unknown): JsonRecord | null {
   } catch {
     return null;
   }
+}
+
+function transcriptObject(text: unknown, location: string): JsonRecord {
+  const value = parseJson(text);
+  if (value === null) throw new Error(`opencode: invalid JSON payload at ${location}`);
+  return value;
+}
+
+function modernMessageData(message: SessionMessageRow): JsonRecord {
+  const data = transcriptObject(message.data, `session_message ${message.id}`);
+  if (message.type === 'user' && typeof data.text !== 'string') {
+    throw new Error(`opencode: invalid user payload at session_message ${message.id}`);
+  }
+  if (message.type === 'assistant') {
+    if (!Array.isArray(data.content) || data.content.some(item => !isRecord(item)
+      || typeof item.type !== 'string'
+      || ((item.type === 'text' || item.type === 'reasoning') && typeof item.text !== 'string')
+      || (item.type === 'tool' && (str(item.id) === null || str(item.name) === null
+        || !isRecord(item.state) || typeof item.state.status !== 'string')))) {
+      throw new Error(`opencode: invalid assistant payload at session_message ${message.id}`);
+    }
+  }
+  // The pre-split writer records callID/output/time, with no status or exit.
+  const preSplitShell = data.status === undefined && typeof data.callID === 'string'
+    && typeof data.output === 'string' && isRecord(data.time) && typeof data.time.created === 'number';
+  if (message.type === 'shell' && (typeof data.command !== 'string' || (!preSplitShell && typeof data.status !== 'string')
+    || (data.exit !== undefined && (typeof data.exit !== 'number' || !Number.isFinite(data.exit)))
+    || (data.output !== undefined && typeof data.output !== 'string'
+      && (!isRecord(data.output) || typeof data.output.output !== 'string')))) {
+    throw new Error(`opencode: invalid shell payload at session_message ${message.id}`);
+  }
+  return data;
+}
+
+function legacyMessageData(message: MessageRow): JsonRecord {
+  const data = transcriptObject(message.data, `message ${message.id}`);
+  if (data.role !== 'user' && data.role !== 'assistant') {
+    throw new Error(`opencode: invalid role payload at message ${message.id}`);
+  }
+  return data;
+}
+
+function legacyPartData(part: PartRow): JsonRecord {
+  const data = transcriptObject(part.data, `part ${part.id}`);
+  if (typeof data.type !== 'string'
+    || ((data.type === 'text' || data.type === 'reasoning') && typeof data.text !== 'string')) {
+    throw new Error(`opencode: invalid part payload at part ${part.id}`);
+  }
+  return data;
 }
 
 function str(value: unknown): string | null {
@@ -89,15 +138,10 @@ export function parseModelRef(value: unknown): string | null {
   return null;
 }
 
-function checkIsSubagent(db: SqliteDb, parentId: string | null, format: 'v1' | 'v2'): boolean {
+function checkIsSubagent(db: SqliteDb, parentId: string | null, tables: ReadonlySet<string>): boolean {
   if (parentId === null || parentId.length === 0) return false;
-  const table = format === 'v2' ? 'session_v2' : 'session';
-  try {
-    const parent = db.prepare(`SELECT 1 FROM ${table} WHERE id = ?`).get(parentId);
-    return parent !== undefined;
-  } catch {
-    return false;
-  }
+  return (['session_v2', 'session'] as const).some(table => tables.has(table)
+    && db.prepare(`SELECT 1 FROM ${table} WHERE id = ?`).get(parentId) !== undefined);
 }
 
 const timestampOfMs = (time: number | null | undefined): string | null => (
@@ -159,8 +203,8 @@ function sourceTables(db: SqliteDb): Set<string> {
       (db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{ name: unknown }>)
         .map(r => String(r.name)),
     );
-  } catch {
-    return new Set();
+  } catch (cause) {
+    throw new Error(`opencode: unable to read transcript tables: ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
   }
 }
 
@@ -220,7 +264,6 @@ interface SessionRow {
   id: string;
   project_id: string | null;
   parent_id: string | null;
-  fork_session_id?: string | null;
   directory: string | null;
   title: string | null;
   version: string | null;
@@ -271,8 +314,12 @@ interface RevertInfo {
 }
 
 function parseRevert(revert: string | null): RevertInfo | null {
-  const value = parseJson(revert);
-  if (value === null) return null;
+  if (revert === null) return null;
+  const value = transcriptObject(revert, 'session revert');
+  if (typeof value.messageID !== 'string'
+    || (value.partID !== undefined && value.partID !== null && typeof value.partID !== 'string')) {
+    throw new Error('opencode: invalid revert payload');
+  }
   return {
     messageID: str(value.messageID),
     partID: str(value.partID),
@@ -402,6 +449,43 @@ interface DiscoveredSessionEntry {
   row: SessionRow;
 }
 
+type SessionTable = 'session_v2' | 'session';
+
+function sessionSelect(table: SessionTable): string {
+  // Metadata tables and wire formats have separate lifecycles: before the V2
+  // split (v1.19.3), modern session_message rows also belonged to `session`.
+  return `SELECT id, project_id, parent_id, directory, title, version, revert, cost,
+    tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write,
+    time_created, time_updated, time_archived, agent, model FROM ${table}`;
+}
+
+function sessionFormat(
+  db: SqliteDb,
+  tables: ReadonlySet<string>,
+  table: SessionTable,
+  id: string,
+  modernIds?: ReadonlySet<string>,
+): 'v1' | 'v2' {
+  const modern = tables.has('session_message');
+  const legacy = tables.has('message') && tables.has('part');
+  if (modern && (table === 'session_v2' || !legacy || (modernIds
+    ? modernIds.has(id)
+    : db.prepare('SELECT 1 FROM session_message WHERE session_id = ? LIMIT 1').get(id) !== undefined))) {
+    return 'v2';
+  }
+  if (table === 'session' && legacy) return 'v1';
+  throw new Error(`opencode: no recognized message tables for ${table} session ${id}`);
+}
+
+function readSessionEntry(db: SqliteDb, tables: ReadonlySet<string>, id: string): DiscoveredSessionEntry | undefined {
+  for (const table of ['session_v2', 'session'] as const) {
+    if (!tables.has(table)) continue;
+    const row = db.prepare(`${sessionSelect(table)} WHERE id = ?`).get(id) as unknown as SessionRow | undefined;
+    if (row !== undefined) return { row, format: sessionFormat(db, tables, table, id) };
+  }
+  return undefined;
+}
+
 function discoverAtStore(
   dbPath: string,
   ctx: DiscoverContext,
@@ -445,54 +529,40 @@ function discoverAtStore(
   }
 
   try {
-    const tables = sourceTables(db);
-    const hasV2 = tables.has('session_v2') && tables.has('session_message');
-    const hasV1 = tables.has('session') && tables.has('message') && tables.has('part');
-
-    if (!hasV2 && !hasV1) {
-      ctx.reportIncompleteInventory?.({ path: dbPath, error: 'Session database has no recognized transcript tables' });
-      return [];
-    }
-
     db.exec('BEGIN');
     try {
-      const sessionsMap = new Map<string, DiscoveredSessionEntry>();
-
-      if (hasV2) {
-        const v2Rows = db.prepare(
-          'SELECT id, project_id, parent_id, fork_session_id, directory, title, version, revert, cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write, time_created, time_updated, time_archived, agent, model FROM session_v2',
-        ).all() as unknown as SessionRow[];
-        for (const row of v2Rows) {
-          sessionsMap.set(row.id, { format: 'v2', row });
-        }
-      }
-
-      if (hasV1) {
-        const v1Rows = db.prepare(
-          'SELECT id, project_id, parent_id, directory, title, version, revert, cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write, time_created, time_updated, time_archived, agent, model FROM session',
-        ).all() as unknown as SessionRow[];
-        for (const row of v1Rows) {
-          if (!sessionsMap.has(row.id)) {
-            sessionsMap.set(row.id, { format: 'v1', row });
-          }
-        }
+      const tables = sourceTables(db);
+      const hasModern = tables.has('session_message');
+      const hasLegacy = tables.has('message') && tables.has('part');
+      if ((!tables.has('session_v2') && !tables.has('session')) || (!hasModern && !hasLegacy)) {
+        throw new Error('Session database has no recognized transcript tables');
       }
 
       const v2Counts = new Map<string, number>();
-      if (hasV2) {
+      if (hasModern) {
         for (const r of db.prepare(
           'SELECT session_id, COUNT(*) as c FROM session_message GROUP BY session_id',
         ).all() as unknown as Array<{ session_id: string; c: number }>) {
           v2Counts.set(r.session_id, r.c);
         }
       }
-
       const v1Counts = new Map<string, number>();
-      if (hasV1) {
+      if (hasLegacy) {
         for (const r of db.prepare(
           'SELECT session_id, COUNT(*) as c FROM message GROUP BY session_id',
         ).all() as unknown as Array<{ session_id: string; c: number }>) {
           v1Counts.set(r.session_id, r.c);
+        }
+      }
+
+      const modernIds = new Set(v2Counts.keys());
+      const sessionsMap = new Map<string, DiscoveredSessionEntry>();
+      for (const table of ['session_v2', 'session'] as const) {
+        if (!tables.has(table)) continue;
+        for (const row of db.prepare(sessionSelect(table)).all() as unknown as SessionRow[]) {
+          if (!sessionsMap.has(row.id)) {
+            sessionsMap.set(row.id, { row, format: sessionFormat(db, tables, table, row.id, modernIds) });
+          }
         }
       }
 
@@ -750,7 +820,7 @@ function* parseV2(
     const isMessageActive = activeCutIndex === -1 || mIdx < activeCutIndex;
     const baseVisibility: MessageVisibility = isMessageActive ? 'visible' : 'inactive';
     const messageTimestamp = timestampOfMs(m.time_created);
-    const data = parseJson(m.data) ?? {};
+    const data = modernMessageData(m);
 
     if (isMessageActive && m.time_updated) {
       const updatedTime = timestampOfMs(m.time_updated);
@@ -1210,9 +1280,13 @@ function* parseV2(
       const uuid = `${sessionId}:m:${String(m.seq).padStart(6, '0')}:${encodeURIComponent(m.id)}:msg`;
       const command = str(data.command);
       const status = str(data.status);
-      const output = data.output !== undefined && data.output !== null
-        ? (typeof data.output === 'string' ? data.output : JSON.stringify(data.output))
-        : '';
+      const output = typeof data.output === 'string' ? data.output
+        : isRecord(data.output) && typeof data.output.output === 'string' ? data.output.output : '';
+      const terminal = status === 'exited' || status === 'timeout' || status === 'killed'
+        || status === 'completed' || status === 'error'
+        || (status === null && isRecord(data.time) && typeof data.time.completed === 'number');
+      const failed = status === 'timeout' || status === 'killed' || status === 'error'
+        || (status === 'exited' && typeof data.exit === 'number' && data.exit !== 0);
       const toolCallId = `${uuid}:call:${encodeURIComponent(m.id)}`;
       const usage = v2UsageTokens(data.tokens);
       visibleCount += baseVisibility === 'visible' ? 1 : 0;
@@ -1247,7 +1321,7 @@ function* parseV2(
         input_json: JSON.stringify({ command: command ?? '' }),
         file_path: null,
       });
-      if (status === 'completed' || status === 'error' || output.length > 0) {
+      if (terminal || output.length > 0) {
         records.push({
           kind: 'tool_result',
           tool_use_id: toolCallId,
@@ -1255,7 +1329,7 @@ function* parseV2(
           session_id: sessionId,
           content: trunc(output),
           file_path: null,
-          is_error: status === 'error' ? 1 : 0,
+          is_error: failed ? 1 : 0,
         });
       }
       previousMessageUuid = uuid;
@@ -1368,7 +1442,7 @@ function* parseV1(
 
   for (let mIdx = 0; mIdx < messages.length; mIdx++) {
     const m = messages[mIdx]!;
-    const mData = parseJson(m.data) ?? {};
+    const mData = legacyMessageData(m);
     const role = str(mData.role) ?? 'user';
     const messageTimestamp = timestampOfMs(m.time_created);
     const mParts = partsByMessage.get(m.id) ?? [];
@@ -1388,8 +1462,7 @@ function* parseV1(
       let userEmittedAny = false;
       for (let pIdx = 0; pIdx < mParts.length; pIdx++) {
         const p = mParts[pIdx]!;
-        const pData = parseJson(p.data);
-        if (pData === null) continue;
+        const pData = legacyPartData(p);
         let isPartActive = true;
         if (isAfterRevert) {
           isPartActive = false;
@@ -1477,8 +1550,7 @@ function* parseV1(
 
       for (let pIdx = 0; pIdx < mParts.length; pIdx++) {
         const p = mParts[pIdx]!;
-        const pData = parseJson(p.data);
-        if (pData === null) continue;
+        const pData = legacyPartData(p);
 
         let isPartActive = true;
         if (isAfterRevert) {
@@ -1802,28 +1874,12 @@ function* parse(
     db.exec('BEGIN');
     try {
       const tables = sourceTables(db);
-      let session: SessionRow | undefined;
-      let format: 'v1' | 'v2' = meta.format;
-
-      if (tables.has('session_v2')) {
-        session = db.prepare(
-          'SELECT id, project_id, parent_id, fork_session_id, directory, title, version, revert, cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write, time_created, time_updated, time_archived, agent, model FROM session_v2 WHERE id = ?',
-        ).get(meta.rawSessionId) as unknown as SessionRow | undefined;
-        if (session !== undefined) format = 'v2';
-      }
-
-      if (session === undefined && tables.has('session')) {
-        session = db.prepare(
-          'SELECT id, project_id, parent_id, directory, title, version, revert, cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write, time_created, time_updated, time_archived, agent, model FROM session WHERE id = ?',
-        ).get(meta.rawSessionId) as unknown as SessionRow | undefined;
-        if (session !== undefined) format = 'v1';
-      }
-
-      if (session === undefined) {
+      const entry = readSessionEntry(db, tables, meta.rawSessionId);
+      if (entry === undefined) {
         throw new Error(`opencode: session vanished before parse: ${meta.rawSessionId}`);
       }
-
-      const verifiedIsSubagent = checkIsSubagent(db, session.parent_id, format);
+      const { row: session, format } = entry;
+      const verifiedIsSubagent = checkIsSubagent(db, session.parent_id, tables);
       if (verifiedIsSubagent !== (unit.isSubagent === true)) {
         throw new Error(`opencode: session parent classification changed during parse: ${session.id}`);
       }
@@ -1872,22 +1928,10 @@ function raw(input: RawLookup, opener: OpencodeDatabaseOpener): RawRecord | null
     db.exec('BEGIN');
     try {
       const tables = sourceTables(db);
-      let sessionRow: SessionRow | undefined;
-      let sessionFormat: 'v1' | 'v2' = 'v2';
-      if (tables.has('session_v2')) {
-        sessionRow = db.prepare(
-          'SELECT id, project_id, parent_id, fork_session_id, directory, title, version, revert, cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write, time_created, time_updated, time_archived, agent, model FROM session_v2 WHERE id = ?',
-        ).get(rawSessionId) as unknown as SessionRow | undefined;
-      }
-      if (sessionRow === undefined && tables.has('session')) {
-        sessionRow = db.prepare(
-          'SELECT id, project_id, parent_id, directory, title, version, revert, cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write, time_created, time_updated, time_archived, agent, model FROM session WHERE id = ?',
-        ).get(rawSessionId) as unknown as SessionRow | undefined;
-        if (sessionRow !== undefined) sessionFormat = 'v1';
-      }
-      if (sessionRow === undefined) return null;
-
-      const isSubagent = checkIsSubagent(db, sessionRow.parent_id, sessionFormat);
+      const entry = readSessionEntry(db, tables, rawSessionId);
+      if (entry === undefined) return null;
+      const { row: sessionRow, format: sessionFormat } = entry;
+      const isSubagent = checkIsSubagent(db, sessionRow.parent_id, tables);
 
       // Verify cursor if supplied
       if (input.cursor !== undefined && input.cursor !== null) {
@@ -1931,7 +1975,7 @@ function raw(input: RawLookup, opener: OpencodeDatabaseOpener): RawRecord | null
             'SELECT id, session_id, type, seq, time_created, time_updated, data FROM session_message WHERE session_id = ? AND id = ?',
           ).get(rawSessionId, rawMsgId) as unknown as SessionMessageRow | undefined;
           if (!row || row.type !== 'compaction') return null;
-          const parsedData = parseJson(row.data) ?? {};
+          const parsedData = modernMessageData(row);
           if (str(parsedData.status) !== 'completed' || str(parsedData.summary) === null) return null;
           projection = {
             format: 'v2',
@@ -1959,7 +2003,7 @@ function raw(input: RawLookup, opener: OpencodeDatabaseOpener): RawRecord | null
           ).get(rawSessionId, rawMsgId) as unknown as SessionMessageRow | undefined;
           if (!row || row.seq !== seq) return null;
 
-          const parsedData = parseJson(row.data) ?? {};
+          const parsedData = modernMessageData(row);
           projection = {
             format: 'v2',
             message: {
@@ -2047,11 +2091,11 @@ function raw(input: RawLookup, opener: OpencodeDatabaseOpener): RawRecord | null
           'SELECT id, message_id, session_id, time_created, time_updated, data FROM part WHERE session_id = ? AND message_id = ? ORDER BY id',
         ).all(rawSessionId, rawMsgId) as unknown as PartRow[];
 
-        const parsedMData = parseJson(mRow.data) ?? {};
+        const parsedMData = legacyMessageData(mRow);
         const parsedParts = parts.map(p => ({
           id: p.id,
           time_created: p.time_created,
-          data: parseJson(p.data) ?? {},
+          data: legacyPartData(p),
         }));
 
         projection = {
@@ -2154,10 +2198,21 @@ export function createOpencodeProvider({
     },
     indexVersionMarker: OPENCODE_CANONICAL_TRANSCRIPT_MARKER,
     sessionUnitKey: (session) => session.jsonlPath,
+    watchHints: (unitKey) => {
+      const delimiter = unitKey.lastIndexOf('#ses:');
+      if (delimiter < 1) return [];
+      const store = unitKey.slice(0, delimiter);
+      if (resolvedRoot === undefined && process.env.OPENCODE_DB?.trim() === ':memory:') return [];
+      const scope = resolveOpencodeRoot(resolvedRoot, homeDir);
+      if (scope.singleDbFile !== undefined
+        ? normalize(store) !== normalize(scope.singleDbFile)
+        : normalize(dirname(store)) !== normalize(scope.rootDir)) return [];
+      return [store, `${store}-wal`];
+    },
     discover: (ctx: DiscoverContext) => discoverAll(resolvedRoot, homeDir, ctx, opener),
     parse: (unit, cursor) => parse(unit, cursor, opener),
     watchTargets: (configuredRoot: string): WatchTarget[] => {
-      const isDefault = !configuredRoot || configuredRoot.trim().length === 0 || normalize(configuredRoot) === normalize(defaultDir);
+      const isDefault = resolvedRoot === undefined && (!configuredRoot || configuredRoot.trim().length === 0 || normalize(configuredRoot) === normalize(defaultDir));
       if (isDefault) {
         const envDb = process.env.OPENCODE_DB;
         if (envDb !== undefined && envDb.trim().length > 0 && envDb.trim() !== ':memory:') {

@@ -114,14 +114,32 @@ function expandHintDirectory(dir: string): string[] {
     .map(({ file }) => file);
 }
 
-export function readRecentTranscriptHints(db: SqliteDb, limit = WATCH_HINT_LIMIT): string[] {
-  const rows = db.prepare(
-    "SELECT jsonl_path FROM index_state WHERE jsonl_path NOT LIKE '\\_\\_%' ESCAPE '\\' ORDER BY mtime DESC LIMIT ?",
-  ).all(limit * 4);
+export function readRecentTranscriptHints(db: SqliteDb, limit = WATCH_HINT_LIMIT, registry?: ProviderRegistry): string[] {
+  const statement = db.prepare(
+    "SELECT jsonl_path FROM index_state WHERE jsonl_path NOT LIKE '\\_\\_%' ESCAPE '\\' ORDER BY mtime DESC",
+  );
+  // Many session units may expand to one store. Budget after expansion rather
+  // than truncating the unit census and starving the next channel. Both runtime
+  // bindings stream; all() keeps existing minimal test doubles compatible.
+  const rows = statement.iterate ? statement.iterate() : statement.all();
   const hints: string[] = [];
+  const seen = new Set<string>();
+  const add = (file: string) => {
+    if (hints.length >= limit || seen.has(file)) return;
+    seen.add(file);
+    hints.push(file);
+  };
+  const adapters = registry?.list() ?? [];
   for (const row of rows) {
     if (hints.length >= limit) break;
     const key = String(row.jsonl_path);
+    const providerFiles = adapters.flatMap(provider => provider.watchHints?.(key) ?? []);
+    if (providerFiles.length > 0) {
+      // An adapter may include a currently absent WAL: polling must also see
+      // its creation when the writer resumes without a native notification.
+      for (const file of providerFiles) add(file);
+      continue;
+    }
     let isDirectory: boolean;
     try {
       isDirectory = statSync(key).isDirectory();
@@ -129,12 +147,12 @@ export function readRecentTranscriptHints(db: SqliteDb, limit = WATCH_HINT_LIMIT
       continue; // deleted between build and hint collection
     }
     if (!isDirectory) {
-      hints.push(key);
+      add(key);
       continue;
     }
     for (const file of expandHintDirectory(key)) {
       if (hints.length >= limit) break;
-      hints.push(file);
+      add(file);
     }
   }
   return hints;

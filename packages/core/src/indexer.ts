@@ -289,7 +289,7 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
           inventoryIssues,
           skipped: 0,
           skippedFiles,
-          watchHints: readRecentTranscriptHints(db),
+          watchHints: readRecentTranscriptHints(db, undefined, registry),
         };
       }
 
@@ -362,7 +362,7 @@ function buildIndex({ force = false, ignoreRecentBuild = false, ignoreDaemonOwne
         inventoryIssues,
         skipped: skippedFiles.length,
         skippedFiles,
-        watchHints: readRecentTranscriptHints(db),
+        watchHints: readRecentTranscriptHints(db, undefined, registry),
       };
     } finally {
       db.close();

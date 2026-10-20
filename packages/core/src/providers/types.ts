@@ -322,6 +322,13 @@ export interface ProviderAdapter extends Provider {
    * canonical source path. File-backed providers normally omit this.
    */
   sessionUnitKey?(session: IndexedSession): string;
+  /**
+   * Expand a provider-owned virtual unit key into real files for bounded
+   * startup/reconcile hot polling. Return [] for keys this adapter does not own.
+   * Called in the indexing worker; no source reads belong in the main process.
+   * Files may be absent temporarily (for example, a checkpointed WAL).
+   */
+  watchHints?(unitKey: string): readonly string[];
   watchTargets(configuredRoot: string): WatchTarget[];
   raw(input: RawLookup): RawRecord | null;
 }

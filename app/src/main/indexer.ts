@@ -509,7 +509,7 @@ function buildIndex({
           complete: true,
           incompleteProviders,
           inventoryIssues,
-          watchHints: readRecentTranscriptHints(db),
+          watchHints: readRecentTranscriptHints(db, undefined, registry),
         };
       }
 
@@ -571,7 +571,7 @@ function buildIndex({
         complete: providerResult.complete,
         incompleteProviders,
         inventoryIssues,
-        watchHints: readRecentTranscriptHints(db),
+        watchHints: readRecentTranscriptHints(db, undefined, registry),
       };
     } finally {
       if (messageFtsTriggersDropped) {

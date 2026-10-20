@@ -16,6 +16,7 @@ import { persist } from '../packages/core/src/persist.ts';
 import {
   createProviderIndexPlan,
   indexProviderPlan,
+  readRecentTranscriptHints,
 } from '../packages/core/src/provider-indexing.ts';
 import { runWriteTransaction } from '../packages/core/src/tx.ts';
 import {
@@ -30,6 +31,9 @@ import { openOpencodeDatabaseWithNodeSqlite } from '../packages/core/src/provide
 import { createProviderRegistry } from '../packages/core/src/providers/registry.ts';
 import { assembleSessionDetail } from '../packages/core/src/session-detail.ts';
 import { makeTempDir } from './temp-dirs.mjs';
+import { createConfiguredBuiltinProviderRuntime } from '../packages/core/src/provider-settings.ts';
+import { createQueryApi } from '../packages/core/src/query.ts';
+import { upstreamStore, upstreamSession, upstreamMessage } from './opencode-test-helpers.mjs';
 
 const SCHEMA = readFileSync(new URL('../packages/core/src/schema.sql', import.meta.url), 'utf8');
 
@@ -136,6 +140,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS session_message_session_seq_idx ON session_mes
 CREATE INDEX IF NOT EXISTS session_message_session_time_created_id_idx ON session_message (session_id, time_created, id);
 CREATE INDEX IF NOT EXISTS message_session_time_created_id_idx ON message (session_id, time_created, id);
 CREATE INDEX IF NOT EXISTS part_message_id_id_idx ON part (message_id, id);
+CREATE INDEX IF NOT EXISTS part_session_idx ON part (session_id);
 `;
 
 function openDb(path) {
@@ -1680,4 +1685,248 @@ test('P2-11: deterministic V1 part ordering by upstream ID regardless of inserti
   assert.equal(msgs[0].text, 'first', 'first part emitted first');
   assert.equal(msgs[1].text, 'second', 'second part emitted second');
   assert.equal(msgs[1].parent_uuid, msgs[0].uuid, 'parent chain flows from first to second');
+});
+
+test('review regression: v1.19.3 modern writer and legacy history coexist through query, raw, updates and schema rename', () => {
+  const { db, provider, path } = upstreamStore();
+  upstreamSession(db, 'modern');
+  upstreamSession(db, 'child', 'session', 'modern');
+  upstreamSession(db, 'legacy');
+  upstreamMessage(db, 'modern', 'msg_user', 'user', 1, { text: 'modern prompt' });
+  upstreamMessage(db, 'modern', 'msg_answer', 'assistant', 2, {
+    content: [{ type: 'text', text: 'modern answer' }],
+    tokens: { input: 10, output: 5, reasoning: 2, cache: { read: 3, write: 0 } },
+  });
+  upstreamMessage(db, 'child', 'msg_child', 'user', 1, { text: 'child prompt' });
+  db.prepare('INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)')
+    .run('msg_legacy', 'legacy', 1000, 1000, JSON.stringify({ role: 'user' }));
+  db.prepare('INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)')
+    .run('part_legacy', 'msg_legacy', 'legacy', 1000, 1000, JSON.stringify({ type: 'text', text: 'legacy prompt' }));
+  const idx = indexFixture(provider);
+  try {
+    idx.run();
+    const id = opencodeSessionId('modern', path);
+    const query = createQueryApi(idx.db, { providerRegistry: createProviderRegistry([provider]) });
+    const modern = query.messages({ sessionId: id });
+    assert.equal(modern.messages.length, 2, 'the actual modern writer retains both messages');
+    assert.equal(query.sessions({ source: 'opencode' }).length, 3);
+    assert.equal(idx.db.prepare('SELECT input_tokens FROM messages WHERE text=?').get('modern answer').input_tokens, 13);
+    assert.equal(idx.db.prepare('SELECT output_tokens FROM messages WHERE text=?').get('modern answer').output_tokens, 7);
+    const user = idx.db.prepare('SELECT uuid FROM messages WHERE text=?').get('modern prompt');
+    assert.match(query.raw(user.uuid).text, /modern prompt/);
+    assert.equal(idx.db.prepare('SELECT session_id FROM subagents').get().session_id, id);
+    assert.ok(idx.db.prepare('SELECT uuid FROM messages WHERE text=?').get('legacy prompt'));
+    const unit = discover(provider).find(u => u.sessionId === id);
+    const direct = assembleSessionDetail([...provider.parse(unit, null)]);
+    assert.deepEqual(direct, assembleSessionDetail({
+      session: idx.db.prepare('SELECT * FROM sessions WHERE id=?').get(id),
+      messages: idx.db.prepare('SELECT * FROM messages WHERE session_id=? ORDER BY timestamp,rowid').all(id),
+      toolCalls: [], toolResults: [],
+    }));
+    db.prepare('UPDATE session_message SET data=? WHERE id=?').run(JSON.stringify({ text: 'same-ms update' }), 'msg_user');
+    idx.run();
+    assert.ok(idx.db.prepare('SELECT uuid FROM messages WHERE text=?').get('same-ms update'));
+    assert.match(query.raw(user.uuid).text, /same-ms update/);
+    // The official pre-split V2 migration renames the metadata table in place.
+    db.prepare('DELETE FROM session WHERE id=?').run('legacy');
+    db.exec('ALTER TABLE session RENAME TO session_v2');
+    idx.run();
+    assert.ok(query.sessions({ source: 'opencode' }).some(s => s.id === id));
+    assert.match(query.raw(user.uuid).text, /same-ms update/);
+    db.prepare('DELETE FROM session_message WHERE id=?').run('msg_answer');
+    idx.run();
+    assert.equal(query.messages({ sessionId: id }).messages.length, 1);
+  } finally { db.close(); idx.close(); }
+});
+
+test('review regression: malformed payloads retain the last complete snapshot and cursor, then recover', () => {
+  for (const [table, badData, messageType = 'user'] of [
+    ['session_message', '{'], ['session_message', 'null'],
+    ['session_message', JSON.stringify({ text: 42 })],
+    ['session_message', JSON.stringify({ content: 'invalid' }), 'assistant'],
+    ['session_message', JSON.stringify({ content: [{ type: 'text', text: 42 }] }), 'assistant'],
+    ['session_message', JSON.stringify({ content: [{ type: 'tool', id: 'call', name: 42, state: { status: 'running' } }] }), 'assistant'],
+    ['message', '{'], ['part', '{'], ['part', JSON.stringify({ type: 'text', text: 42 })],
+  ]) {
+    const { db, provider } = upstreamStore(table === 'session_message' ? 'v2.0.32' : 'v1.19.3');
+    upstreamSession(db, 's', table === 'session_message' ? 'session_v2' : 'session');
+    if (table === 'session_message') upstreamMessage(db, 's', 'm', messageType, 1,
+      messageType === 'assistant' ? { content: [{ type: 'text', text: 'last-good' }] } : { text: 'last-good' });
+    else {
+      db.prepare('INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)')
+        .run('m', 's', 1000, 1000, JSON.stringify({ role: 'user' }));
+      db.prepare('INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)')
+        .run('p', 'm', 's', 1000, 1000, JSON.stringify({ type: 'text', text: 'last-good' }));
+    }
+    const idx = indexFixture(provider);
+    try {
+      idx.run();
+      const before = idx.db.prepare('SELECT * FROM messages').all();
+      assert.equal(before[0]?.text, 'last-good');
+      const cursors = idx.db.prepare('SELECT * FROM index_state ORDER BY jsonl_path').all();
+      const goodData = db.prepare(`SELECT data FROM ${table}`).get().data;
+      db.prepare(`UPDATE ${table} SET data=?`).run(badData);
+      const errors = [];
+      const result = indexProviderPlan({
+        db: idx.db, plan: createProviderIndexPlan(idx.db, createProviderRegistry([provider])),
+        runTransaction: (_label, work) => runWriteTransaction(idx.db, work),
+        onError: error => { errors.push(error); return 'skip'; },
+      });
+      assert.equal(result.complete, false, `${table}: damage cannot publish a complete snapshot`);
+      assert.match(errors[0].message, /invalid.*(JSON|payload)/i);
+      assert.deepEqual(idx.db.prepare('SELECT * FROM messages').all(), before);
+      assert.deepEqual(idx.db.prepare('SELECT * FROM index_state ORDER BY jsonl_path').all(), cursors);
+      db.prepare(`UPDATE ${table} SET data=?`).run(goodData);
+      assert.equal(idx.run().result.complete, true);
+    } finally { db.close(); idx.close(); }
+  }
+});
+
+test('review regression: native shell exit, timeout and killed results remain queryable failures', () => {
+  const { db, provider } = upstreamStore('v2.0.32');
+  upstreamSession(db, 'shells', 'session_v2');
+  const cases = [
+    { status: 'exited', exit: 0, output: 'success' },
+    { status: 'exited', exit: 1, output: 'failed' },
+    { status: 'timeout', output: '' }, { status: 'killed', output: 'terminated' },
+    { status: 'running' },
+  ];
+  cases.forEach((c, i) => upstreamMessage(db, 'shells', `m${i}`, 'shell', i, {
+    shellID: `sh_${i}`, command: 'synthetic-command', status: c.status, exit: c.exit,
+    ...(c.output === undefined ? {} : { output: { output: c.output, cursor: c.output.length, size: c.output.length, truncated: false } }),
+    time: { created: 1000, ...(c.status === 'running' ? {} : { completed: 1001 }) },
+  }));
+  const idx = indexFixture(provider);
+  try {
+    idx.run();
+    const results = idx.db.prepare('SELECT content,is_error FROM tool_results ORDER BY rowid').all();
+    assert.deepEqual(results.map(r => [r.content, r.is_error]), [['success', 0], ['failed', 1], ['', 1], ['terminated', 1]]);
+    assert.equal(createQueryApi(idx.db).failures({ source: 'opencode' }).length, 3);
+    assert.equal(idx.db.prepare('SELECT COUNT(*) AS n FROM tool_calls').get().n, 5);
+  } finally { db.close(); idx.close(); }
+});
+
+test('review regression: pre-split modern shell rows without status preserve running and empty completed output', () => {
+  const { db, provider } = upstreamStore();
+  upstreamSession(db, 'shells');
+  upstreamMessage(db, 'shells', 'running', 'shell', 1, {
+    callID: 'call_running', command: 'synthetic-command', output: '', time: { created: 1000 },
+  });
+  upstreamMessage(db, 'shells', 'completed', 'shell', 2, {
+    callID: 'call_completed', command: 'synthetic-command', output: 'shell output', time: { created: 1001, completed: 1002 },
+  });
+  upstreamMessage(db, 'shells', 'empty', 'shell', 3, {
+    callID: 'call_empty', command: 'synthetic-command', output: '', time: { created: 1003, completed: 1004 },
+  });
+  const idx = indexFixture(provider);
+  try {
+    idx.run();
+    assert.equal(idx.db.prepare('SELECT COUNT(*) AS n FROM tool_calls').get().n, 3);
+    assert.deepEqual(idx.db.prepare('SELECT content,is_error FROM tool_results ORDER BY rowid').all().map(r => [r.content, r.is_error]), [['shell output', 0], ['', 0]]);
+    const api = createQueryApi(idx.db, { providerRegistry: createProviderRegistry([provider]) });
+    const uuid = idx.db.prepare("SELECT uuid FROM messages WHERE uuid LIKE '%:completed:msg'").get().uuid;
+    assert.match(api.raw(uuid).text, /call_completed/);
+    assert.equal(api.failures({ source: 'opencode' }).length, 0, 'this writer did not record exit status; do not invent a failure');
+  } finally { db.close(); idx.close(); }
+});
+
+test('review regression: explicit default root overrides OPENCODE_DB for discovery and watcher together', () => {
+  const home = makeTempDir('opencode-explicit-default-');
+  const oldXdg = process.env.XDG_DATA_HOME;
+  const oldDb = process.env.OPENCODE_DB;
+  try {
+    delete process.env.XDG_DATA_HOME;
+    const root = defaultOpencodeDataRoot(home);
+    mkdirSync(root, { recursive: true });
+    const { db } = upstreamStore('v2.0.32', 'opencode.db', root);
+    upstreamSession(db, 'explicit', 'session_v2'); db.close();
+    process.env.OPENCODE_DB = join(home, 'other', 'custom.db');
+    const runtime = createConfiguredBuiltinProviderRuntime({ providerRoots: { opencode: root } }, { homeDir: home, openOpencodeDatabase: openDb });
+    const provider = runtime.registry.get('opencode');
+    assert.equal(discover(provider).length, 1);
+    const targets = provider.watchTargets(runtime.roots.opencode);
+    assert.ok(targets.some(t => t.path === join(root, 'opencode.db')));
+    assert.ok(targets.some(t => t.path === join(root, 'opencode.db-wal')));
+    assert.ok(!targets.some(t => t.path === process.env.OPENCODE_DB));
+    const automatic = createConfiguredBuiltinProviderRuntime({}, { homeDir: home, openOpencodeDatabase: openDb });
+    assert.deepEqual(automatic.registry.get('opencode').watchTargets(automatic.roots.opencode), [
+      { kind: 'file', path: process.env.OPENCODE_DB }, { kind: 'file', path: `${process.env.OPENCODE_DB}-wal` },
+    ]);
+  } finally {
+    if (oldXdg === undefined) delete process.env.XDG_DATA_HOME; else process.env.XDG_DATA_HOME = oldXdg;
+    if (oldDb === undefined) delete process.env.OPENCODE_DB; else process.env.OPENCODE_DB = oldDb;
+  }
+});
+
+test('review regression: marker upgrade repairs existing canonical rows atomically and retries after damaged input', () => {
+  const { db, provider, path } = upstreamStore();
+  upstreamSession(db, 's');
+  upstreamMessage(db, 's', 'm', 'user', 1, { text: 'native modern prompt' });
+  const id = opencodeSessionId('s', path);
+  const key = opencodeUnitKey(path, 's');
+  const idx = indexFixture(provider);
+  try {
+    // Literal old marker/cursor: this must model an installation of the PR's
+    // previous version, not another copy of the new constants.
+    idx.db.prepare('INSERT INTO sessions (id,source,jsonl_path,message_count) VALUES (?,?,?,?)')
+      .run(id, 'opencode', key, 0);
+    idx.db.prepare('INSERT INTO messages (uuid,session_id,type,role,text,content_type,source) VALUES (?,?,?,?,?,?,?)')
+      .run('stale-projection', id, 'user', 'user', 'old projection', 'text', 'opencode');
+    idx.db.prepare('INSERT INTO index_state (jsonl_path,mtime,lines_processed,cursor) VALUES (?,?,?,?)')
+      .run('__opencode_canonical_transcript_v1__', 1000, 0, null);
+    idx.db.prepare('INSERT INTO index_state (jsonl_path,mtime,lines_processed,cursor) VALUES (?,?,?,?)')
+      .run(key, 1000, 0, '1000:0:v1:old-empty-fingerprint');
+    const before = idx.db.prepare('SELECT * FROM messages').all();
+    db.prepare('UPDATE session_message SET data=?').run('{');
+    assert.throws(() => idx.run(), /invalid JSON payload/);
+    assert.deepEqual(idx.db.prepare('SELECT * FROM messages').all(), before);
+    assert.equal(idx.db.prepare('SELECT cursor FROM index_state WHERE jsonl_path=?').get(key).cursor, '1000:0:v1:old-empty-fingerprint');
+    assert.equal(idx.db.prepare('SELECT 1 FROM index_state WHERE jsonl_path=?').get('__opencode_canonical_transcript_v2__'), undefined);
+    db.prepare('UPDATE session_message SET data=?').run(JSON.stringify({ text: 'native modern prompt' }));
+    const replay = idx.run();
+    assert.equal(replay.result.complete, true);
+    assert.ok(replay.plan.replayKeys.has('opencode'));
+    assert.equal(idx.db.prepare('SELECT text FROM messages').get().text, 'native modern prompt');
+    assert.equal(idx.db.prepare('SELECT COUNT(*) AS n FROM messages').get().n, 1);
+    assert.ok(idx.db.prepare('SELECT 1 FROM index_state WHERE jsonl_path=?').get('__opencode_canonical_transcript_v2__'));
+    assert.equal(idx.run().plan.items.length, 0, 'the upgrade converges rather than replaying forever');
+  } finally { db.close(); idx.close(); }
+});
+
+test('review regression: hot hints are bounded, deduplicated and scoped to selected OpenCode stores', () => {
+  const { db, provider, path, dir } = upstreamStore('v2.0.32', 'opencode-feature.db');
+  upstreamSession(db, 's', 'session_v2');
+  upstreamSession(db, 's2', 'session_v2');
+  const idx = indexFixture(provider);
+  const registry = createProviderRegistry([provider]);
+  try {
+    idx.run();
+    assert.deepEqual(readRecentTranscriptHints(idx.db, 64, registry), [path, `${path}-wal`]);
+    assert.deepEqual(readRecentTranscriptHints(idx.db, 1, registry), [path]);
+    assert.deepEqual(provider.watchHints(opencodeUnitKey(join(dir, 'excluded', 'opencode.db'), 's')), []);
+    const disabled = createConfiguredBuiltinProviderRuntime({ providerRoots: { opencode: '' } }, { openOpencodeDatabase: openDb });
+    assert.deepEqual(readRecentTranscriptHints(idx.db, 64, disabled.registry), []);
+    const changedRoot = createProviderRegistry([createOpencodeProvider({ rootDir: join(dir, 'new-root'), openDatabase: openDb })]);
+    assert.deepEqual(readRecentTranscriptHints(idx.db, 64, changedRoot), []);
+  } finally { db.close(); idx.close(); }
+});
+
+test('review regression: hundreds of newer sessions in one channel do not hide another channel from startup polling', () => {
+  const first = upstreamStore('v2.0.32', 'opencode-channel-a.db');
+  const second = upstreamStore('v2.0.32', 'opencode-channel-b.db', first.dir);
+  for (let i = 0; i < 257; i++) upstreamSession(first.db, `s${i}`, 'session_v2');
+  first.db.exec('UPDATE session_v2 SET time_updated=2000');
+  upstreamSession(second.db, 'b', 'session_v2');
+  const idx = indexFixture(first.provider);
+  try {
+    idx.run();
+    const registry = createProviderRegistry([first.provider]);
+    const hints = readRecentTranscriptHints(idx.db, 64, registry);
+    assert.deepEqual(hints, [first.path, `${first.path}-wal`, second.path, `${second.path}-wal`]);
+    // Breaking out of a real SQLite iterator must release its statement so
+    // the writer can immediately begin another transaction on this binding.
+    assert.equal(readRecentTranscriptHints(idx.db, 1, registry).length, 1);
+    idx.db.exec('BEGIN IMMEDIATE; ROLLBACK');
+    assert.equal(idx.run().result.complete, true);
+  } finally { first.db.close(); second.db.close(); idx.close(); }
 });
