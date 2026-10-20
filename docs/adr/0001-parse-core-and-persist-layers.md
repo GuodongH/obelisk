@@ -190,6 +190,37 @@ ctime; watcher hints remain the live invalidation path, while reconciliation
 provides the strongest portable metadata check required by the provider cursor
 contract.
 
+### OpenCode metadata discovery and dependent replay
+
+OpenCode keeps source-specific observation and projection behind the same provider
+interface. Discovery compares session headers, verified aggregate heads and legacy
+member metadata; unchanged established stores do not read transcript payloads.
+Changed sessions replay complete snapshots. Legacy/import compatibility can scan
+record metadata; source replacement, migration or an unexplained physical write
+may require full reconciliation. This is session-level incrementality, not a
+universal message CDC protocol. See the pinned writer evidence and cost model in
+[the implementation plan](../opencode-adapter-incremental-plan.md).
+
+A source observation is not a completed transcript snapshot. Provider-private,
+recordless units (`sessionId: ''`, as already used by Hermes) persist the observed
+inventory/revision and pending session work without creating canonical sessions.
+The optional `IndexUnit.requiresCursors` prerequisite is checked in the existing
+per-unit destination transaction. OpenCode first writes pending work, then a
+bounded digest proof that requires that exact observation, then dependent session
+replacements. Large pending cursors are compared once, not for every session.
+A failed observation/proof cannot permit a destructive dependent commit. Control
+units do not schedule canonical marker replay or clear session resume cursors.
+
+Per-session cursors acknowledge successful revisions independently. Pending child
+and descendant replays survive a parent replacement, a failed child transaction,
+and process restart. Missing or unknown observation formats rebuild above the
+highest validated session revision, preventing old successful revisions from
+acknowledging newly scheduled work. Cursor-format recovery is independent of the
+canonical marker; OpenCode's v3 marker repairs changed compaction projections.
+Transient source observations feed the shared indexers' existing bounded inventory
+retry path. Neither the orchestrator nor the canonical schema learns OpenCode SQL
+or key syntax, and no source database is modified by the adapter.
+
 **Consequences.** Golden tests anchor on each adapter's `parse` output (feed
 fixture JSONL, assert the yielded record sequence) — independent of binding and
 persistence. The app's richer changed-path discovery becomes a `discover`

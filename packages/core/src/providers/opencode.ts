@@ -33,7 +33,7 @@ import type { SessionMessageRow, MessageRow, PartRow } from './opencode-source.t
 import { isRecord, modernMessageData, legacyMessageData, legacyPartData, str, parseModelRef, completedCompaction } from './opencode-decode.ts';
 export { parseModelRef } from './opencode-decode.ts';
 
-import { decodeOpencodeUnitKey, opencodeSessionId, opencodeUnitKey, opencodeObservationKey } from './opencode-identity.ts';
+import { decodeOpencodeUnitKey, opencodeSessionId, opencodeUnitKey, opencodeObservationKey, opencodeObservationProofKey } from './opencode-identity.ts';
 export { opencodeStoreHash, opencodeSessionId, opencodeUnitKey } from './opencode-identity.ts';
 
 import { normalizeObservedCwd, projectSlugFromPath } from '../parsing.ts';
@@ -168,7 +168,12 @@ interface OpencodeObservationMeta {
   dbPath: string;
   observation: StoreCursorState;
 }
-type OpencodeUnitMeta = OpencodeSessionMeta | OpencodeTombstoneMeta | OpencodeObservationMeta;
+interface OpencodeObservationProofMeta {
+  kind: 'opencode-observation-proof';
+  dbPath: string;
+  cursor: string;
+}
+type OpencodeUnitMeta = OpencodeSessionMeta | OpencodeTombstoneMeta | OpencodeObservationMeta | OpencodeObservationProofMeta;
 
 function discoverAtStore(
   dbPath: string,
@@ -259,7 +264,11 @@ function discoverAtStore(
       const inventory = digest([...sessionsMap].map(([id, e]) => [id, e.manifest]).sort((a, b) => a[0]!.localeCompare(b[0]!)));
       const observationChanged = priorObservation === null || priorObservation.inventory !== inventory
         || JSON.stringify(priorObservation.store) !== JSON.stringify(store);
-      const revision = (priorObservation?.revision ?? 0) + (observationChanged ? 1 : 0);
+      // Missing/unknown observations cannot reset the ordering below successful
+      // session cursors, or failed dependency work would look acknowledged.
+      const revisionFloor = [...states.values()].reduce((max, state) => Math.max(max, state?.revision ?? 0), priorObservation?.revision ?? 0);
+      const revision = revisionFloor + (observationChanged ? 1 : 0);
+      if (!Number.isSafeInteger(revision)) throw new Error('opencode: observation revision exceeds safe cursor range');
       const unexplainedWrite = priorObservation !== null && priorObservation.inventory === inventory
         && priorObservation.store.identity === store.identity && priorObservation.store.schema === store.schema
         && priorObservation.store.stamp !== store.stamp;
@@ -336,7 +345,16 @@ function discoverAtStore(
       const observationCursor = encodeStoreCursor(observation);
       const needsObservation = observationChanged || units.length > 0;
       if (needsObservation) {
-        for (const unit of units) unit.requiresCursors = [{ key: observationKey, cursor: observationCursor }];
+        // Compare the potentially large pending schedule exactly once. Every
+        // session then checks a bounded proof, avoiding quadratic cursor bytes
+        // on first import, rebuild and large reconciliation batches.
+        const proofKey = opencodeObservationProofKey(dbPath);
+        const proofCursor = `0:0:opencode-observation-proof-v1:${digest(observationCursor)}`;
+        for (const unit of units) unit.requiresCursors = [{ key: proofKey, cursor: proofCursor }];
+        units.unshift({ key: proofKey, sessionId: '',
+          requiresCursors: [{ key: observationKey, cursor: observationCursor }],
+          meta: { kind: 'opencode-observation-proof', dbPath, cursor: proofCursor } satisfies OpencodeObservationProofMeta,
+        });
         units.unshift({ key: observationKey, sessionId: '', meta: {
           kind: 'opencode-observation', dbPath, observation,
         } satisfies OpencodeObservationMeta });
@@ -457,8 +475,16 @@ function* parse(
   opener: OpencodeDatabaseOpener,
 ): Generator<TranscriptRecord, Cursor> {
   const meta = unit.meta as OpencodeUnitMeta;
-  if (!meta || (meta.kind !== 'opencode-session' && meta.kind !== 'opencode-tombstone' && meta.kind !== 'opencode-observation')) {
+  if (!meta || (meta.kind !== 'opencode-session' && meta.kind !== 'opencode-tombstone' && meta.kind !== 'opencode-observation' && meta.kind !== 'opencode-observation-proof')) {
     throw new Error('opencode: invalid unit metadata');
+  }
+
+  if (meta.kind === 'opencode-observation-proof') {
+    if (unit.sessionId !== '' || unit.key !== opencodeObservationProofKey(meta.dbPath)
+      || !/^0:0:opencode-observation-proof-v1:[a-f0-9]{64}$/.test(meta.cursor)) {
+      throw new Error('opencode: invalid observation proof');
+    }
+    return meta.cursor;
   }
 
   if (meta.kind === 'opencode-observation') {

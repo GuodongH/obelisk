@@ -1770,7 +1770,7 @@ test('review regression: malformed payloads retain the last complete snapshot an
       idx.run();
       const before = idx.db.prepare('SELECT * FROM messages').all();
       assert.equal(before[0]?.text, 'last-good');
-      const cursors = idx.db.prepare("SELECT * FROM index_state WHERE jsonl_path NOT LIKE '__opencode_observation_v1__:%' ORDER BY jsonl_path").all();
+      const cursors = idx.db.prepare("SELECT * FROM index_state WHERE jsonl_path NOT LIKE '__opencode_observation%' ORDER BY jsonl_path").all();
       const goodData = db.prepare(`SELECT data FROM ${table}`).get().data;
       db.prepare(`UPDATE ${table} SET data=?`).run(badData);
       const errors = [];
@@ -1782,7 +1782,7 @@ test('review regression: malformed payloads retain the last complete snapshot an
       assert.equal(result.complete, false, `${table}: damage cannot publish a complete snapshot`);
       assert.match(errors[0].message, /invalid.*(JSON|payload)/i);
       assert.deepEqual(idx.db.prepare('SELECT * FROM messages').all(), before);
-      assert.deepEqual(idx.db.prepare("SELECT * FROM index_state WHERE jsonl_path NOT LIKE '__opencode_observation_v1__:%' ORDER BY jsonl_path").all(), cursors);
+      assert.deepEqual(idx.db.prepare("SELECT * FROM index_state WHERE jsonl_path NOT LIKE '__opencode_observation%' ORDER BY jsonl_path").all(), cursors);
       db.prepare(`UPDATE ${table} SET data=?`).run(goodData);
       assert.equal(idx.run().result.complete, true);
     } finally { db.close(); idx.close(); }
@@ -1977,7 +1977,7 @@ test('damaged required legacy tool fields preserve last-good tools and cursor un
     const idx = indexFixture(source.provider);
     try {
       idx.run();
-      const cursors = idx.db.prepare("SELECT * FROM index_state WHERE jsonl_path NOT LIKE '__opencode_observation_v1__:%' ORDER BY jsonl_path").all();
+      const cursors = idx.db.prepare("SELECT * FROM index_state WHERE jsonl_path NOT LIKE '__opencode_observation%' ORDER BY jsonl_path").all();
       const damaged = { ...tool }; delete damaged[field];
       source.db.prepare('UPDATE part SET data=?').run(JSON.stringify(damaged));
       const result = indexProviderPlan({ db: idx.db,
@@ -1985,7 +1985,7 @@ test('damaged required legacy tool fields preserve last-good tools and cursor un
         runTransaction: (_label, work) => runWriteTransaction(idx.db, work), onError: () => 'skip' });
       assert.equal(result.complete, false, field);
       assert.equal(idx.db.prepare('SELECT count(*) n FROM tool_calls').get().n, 1);
-      assert.deepEqual(idx.db.prepare("SELECT * FROM index_state WHERE jsonl_path NOT LIKE '__opencode_observation_v1__:%' ORDER BY jsonl_path").all(), cursors);
+      assert.deepEqual(idx.db.prepare("SELECT * FROM index_state WHERE jsonl_path NOT LIKE '__opencode_observation%' ORDER BY jsonl_path").all(), cursors);
       source.db.prepare('UPDATE part SET data=?').run(JSON.stringify(tool));
       assert.equal(idx.run().result.complete, true);
     } finally { source.db.close(); idx.close(); }
@@ -2162,7 +2162,7 @@ test('a source update between discovery and parse rolls back the unit and retrie
   upstreamMessage(source.db, 's', 'm', 'user', 0, { text: 'last-good' });
   const idx = indexFixture(source.provider);
   try {
-    idx.run(); const before = idx.db.prepare("SELECT * FROM index_state WHERE jsonl_path NOT LIKE '__opencode_observation_v1__:%' ORDER BY jsonl_path").all();
+    idx.run(); const before = idx.db.prepare("SELECT * FROM index_state WHERE jsonl_path NOT LIKE '__opencode_observation%' ORDER BY jsonl_path").all();
     source.db.prepare('UPDATE session_message SET data=?').run(JSON.stringify({ text: 'intermediate' }));
     const plan = createProviderIndexPlan(idx.db, createProviderRegistry([source.provider]));
     source.db.prepare('UPDATE session_message SET data=?').run(JSON.stringify({ text: 'fresh' }));
@@ -2171,7 +2171,7 @@ test('a source update between discovery and parse rolls back the unit and retrie
       runTransaction: (_label, work) => runWriteTransaction(idx.db, work), onError: e => { errors.push(e); return 'skip'; } });
     assert.equal(result.complete, false);
     assert.equal(errors[0].name, 'RetryableSourceReadError'); assert.equal(errors[0].sourcePath, source.path);
-    assert.deepEqual(idx.db.prepare("SELECT * FROM index_state WHERE jsonl_path NOT LIKE '__opencode_observation_v1__:%' ORDER BY jsonl_path").all(), before);
+    assert.deepEqual(idx.db.prepare("SELECT * FROM index_state WHERE jsonl_path NOT LIKE '__opencode_observation%' ORDER BY jsonl_path").all(), before);
     assert.equal(idx.db.prepare('SELECT text FROM messages').get().text, 'last-good');
     assert.equal(idx.run().result.complete, true);
     assert.equal(idx.db.prepare('SELECT text FROM messages').get().text, 'fresh');
@@ -2212,7 +2212,7 @@ test('pending child and grandchild replays survive destination failure, observat
     runTransaction: (_label, work) => runWriteTransaction(idx.db, work),
     onPersisted: item => { if (fail(item.unit)) throw new Error('synthetic destination failure'); }, onError: () => 'skip' });
   try {
-    idx.run(); const before = idx.db.prepare("SELECT * FROM index_state WHERE jsonl_path NOT LIKE '__opencode_observation_v1__:%' ORDER BY jsonl_path").all();
+    idx.run(); const before = idx.db.prepare("SELECT * FROM index_state WHERE jsonl_path NOT LIKE '__opencode_observation%' ORDER BY jsonl_path").all();
     source.db.exec('BEGIN IMMEDIATE');
     source.db.prepare('UPDATE session_message SET data=? WHERE session_id=?').run(JSON.stringify({ text: 'updated parent' }), 'parent');
     source.db.prepare('UPDATE event_sequence SET seq=seq+1 WHERE aggregate_id=?').run('parent'); source.db.exec('COMMIT');
@@ -2220,7 +2220,7 @@ test('pending child and grandchild replays survive destination failure, observat
     assert.equal(observationFailed.complete, false);
     assert.equal(transcriptItems(observationFailed.committed).length, 0, 'uncommitted schedule cannot permit destructive dependents');
     assert.equal(idx.db.prepare('SELECT count(*) n FROM subagents').get().n, 2);
-    assert.deepEqual(idx.db.prepare("SELECT * FROM index_state WHERE jsonl_path NOT LIKE '__opencode_observation_v1__:%' ORDER BY jsonl_path").all(), before);
+    assert.deepEqual(idx.db.prepare("SELECT * FROM index_state WHERE jsonl_path NOT LIKE '__opencode_observation%' ORDER BY jsonl_path").all(), before);
     const partial = run(source.provider, unit => unit.meta.rawSessionId === 'child');
     assert.equal(partial.failedItems.length, 1);
     assert.equal(idx.db.prepare('SELECT count(*) n FROM subagents').get().n, 1, 'child link needs retry while grandchild safely commits');
@@ -2229,4 +2229,63 @@ test('pending child and grandchild replays survive destination failure, observat
     assert.equal(idx.db.prepare('SELECT count(*) n FROM subagents').get().n, 2);
     assert.equal(run(restarted).committed.length, 0);
   } finally { source.db.close(); idx.close(); }
+});
+
+test('missing or unknown observation cursors rebuild pending revisions above successful session revisions', () => {
+  for (const missing of [false, true]) {
+    const source = upstreamStore('v2.0.32');
+    for (const [id, parent] of [['parent', null], ['child', 'parent']]) {
+      upstreamSession(source.db, id, 'session_v2', parent); upstreamMessage(source.db, id, `m${id}`, 'user', 0, { text: id });
+      source.db.prepare('INSERT INTO event_sequence VALUES (?,?,?)').run(id, 1, 'owner');
+    }
+    const idx = indexFixture(source.provider);
+    const update = text => {
+      source.db.exec('BEGIN IMMEDIATE'); source.db.prepare('UPDATE session_message SET data=? WHERE session_id=?').run(JSON.stringify({ text }), 'parent');
+      source.db.prepare('UPDATE event_sequence SET seq=seq+1 WHERE aggregate_id=?').run('parent'); source.db.exec('COMMIT');
+    };
+    const run = failChild => indexProviderPlan({ db: idx.db,
+      plan: createProviderIndexPlan(idx.db, createProviderRegistry([source.provider])),
+      runTransaction: (_label, work) => runWriteTransaction(idx.db, work),
+      onPersisted: item => { if (failChild && item.unit.meta.rawSessionId === 'child') throw new Error('synthetic child failure'); }, onError: () => 'skip' });
+    try {
+      idx.run(); update('warmup'); idx.run();
+      if (missing) idx.db.prepare("DELETE FROM index_state WHERE jsonl_path LIKE '__opencode_observation_v1__:%'").run();
+      else idx.db.prepare("UPDATE index_state SET cursor='0:0:future-observation:opaque' WHERE jsonl_path LIKE '__opencode_observation_v1__:%'").run();
+      update('next parent'); assert.equal(run(true).failedItems.length, 1);
+      assert.equal(idx.db.prepare('SELECT count(*) n FROM subagents').get().n, 0);
+      assert.equal(run(false).complete, true);
+      assert.equal(idx.db.prepare('SELECT count(*) n FROM subagents').get().n, 1);
+      assert.equal(run(false).committed.length, 0);
+    } finally { source.db.close(); idx.close(); }
+  }
+});
+
+test('large replay batches read the pending observation once and use bounded cursor prerequisites per session', () => {
+  const source = upstreamStore('v2.0.32');
+  const sessions = 1000;
+  source.db.exec('BEGIN');
+  for (let i = 0; i < sessions; i++) upstreamSession(source.db, `s${i}`, 'session_v2');
+  source.db.exec('COMMIT');
+  const raw = createMemoryIndex();
+  let pendingReads = 0; let controlBytes = 0;
+  const db = { exec: sql => raw.exec(sql), close: () => raw.close(), prepare: sql => {
+    const stmt = raw.prepare(sql);
+    return { all: (...args) => stmt.all(...args), run: (...args) => stmt.run(...args), get: (...args) => {
+      const row = stmt.get(...args);
+      if (typeof args[0] === 'string' && args[0].startsWith('__opencode_observation') && typeof row?.cursor === 'string') {
+        controlBytes += Buffer.byteLength(row.cursor);
+        if (args[0].startsWith('__opencode_observation_v1__')) pendingReads++;
+      }
+      return row;
+    } };
+  } };
+  try {
+    const result = indexProviderPlan({ db, plan: createProviderIndexPlan(db, createProviderRegistry([source.provider])),
+      runTransaction: (_label, work) => runWriteTransaction(raw, work), onError: error => { throw error; } });
+    assert.equal(result.complete, true);
+    assert.equal(raw.prepare('SELECT count(*) n FROM sessions').get().n, sessions);
+    assert.equal(raw.prepare("SELECT count(*) n FROM sessions WHERE id='' ").get().n, 0, 'control state never becomes canonical history');
+    assert.equal(pendingReads, 1, 'full pending list is verified once, not once per session');
+    assert.ok(controlBytes < sessions * 512, `bounded control bytes per session: ${controlBytes}`);
+  } finally { source.db.close(); db.close(); }
 });

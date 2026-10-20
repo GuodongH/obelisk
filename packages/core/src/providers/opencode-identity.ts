@@ -33,3 +33,7 @@ export function decodeOpencodeUnitKey(key: string): { dbPath: string; nativeId: 
 export function opencodeObservationKey(storePath: string): string {
   return `__opencode_observation_v1__:${opencodeStoreHash(storePath)}`;
 }
+
+export function opencodeObservationProofKey(storePath: string): string {
+  return `__opencode_observation_proof_v1__:${opencodeStoreHash(storePath)}`;
+}

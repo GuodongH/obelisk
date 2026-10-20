@@ -122,7 +122,7 @@ four failed for the reported behavior. Centralized the byte-compatible identity
 codec, introduced explicit authenticated tombstone metadata, fixed shared watcher
 union semantics and shared native payload decoding between projection and raw.
 Pre-split completed compaction now projects to summaries; canonical marker is v3.
-Targeted provider/watcher suites: 44 passed; root/app typecheck: zero errors.
+Targeted provider/watcher suites: 44 passed; root/apptypecheck: zero errors.
 
 Two existing assertions necessarily follow the new representation: the tombstone
 now carries its real native ID and an explicit kind (instead of the empty-ID
@@ -155,15 +155,14 @@ bounded inventory retry path, including strict rebuild failures.
 
 The fallback is deliberately conservative: checkpoints, WAL replacement or an
 unexplained data-only edit can schedule a full payload reconciliation. Normal
-verified head updates in mixed stores do not do so. Metadata is not CDC: concurrent
-out-of-contract SQL edits concealed by another session's legitimate metadata/head
-update are not attested. Filesystem timestamp/identity guarantees still apply.
+verified head updates in mixed stores do not do so. Metadata is not CDC: out-of-contract SQL edits concealed within the same unobserved interval by another
+session's legitimate metadata/head update are not attested. Filesystem timestamp/identity guarantees still apply.
 Sorting and indexed metadata probes add their ordinary comparison/lookup costs;
 the stated O(A + S + C log N + B_changed) model omits sorting constants and applies
 to payload work, not a claim of zero source-page IO or message-level O(delta).
 
 Focused integration: 83 passed (provider, app indexing, service and watcher filter),
-root/app typecheck: zero errors. Corrected performance regressions were also run
+root/apptypecheck: zero errors. Corrected performance regressions were also run
 against commit 27ef497 and failed on actual full payload reads, then passed with
 this implementation. The 10x-unrelated-history case reads 5 affected payload rows
 per modern update, with zero unchanged payload reads, including cold provider
@@ -197,7 +196,7 @@ The observation adjustment supersedes the earlier per-session-only prototype
 record above. New regressions cover the sequential failed-head/body-edit case,
 failed child plus grandchild replay after restart, and a failed observation write
 preventing every destructive dependent. Focused suites: 85 passed; root/app
- typecheck: zero errors. The source observation is stored before dependent work,
+typecheck: zero errors. The source observation is stored before dependent work,
 not as a later completion gate; exact cursor prerequisites are checked in the
 existing destination transaction. Recordless control units do not start canonical
 marker replay or clear last-good session cursors.
@@ -217,3 +216,19 @@ The payload improvement is independent: zero unchanged payload rows, and only
 changed-session payloads for verified event writers. The source observation adds
 one metadata-only validation snapshot when the observed source or pending work
 changes. It does not restore a full-history payload scan on ordinary updates.
+
+
+### Final recovery and control-cost refinements
+
+Unknown or missing observation formats now allocate a revision above every
+validated live-session cursor, rather than resetting to one. The independent
+review's revision-two / failed-child regression was red before this correction.
+A second recordless proof unit requires the full pending cursor once and emits a
+fixed-size digest cursor; session transactions depend on that proof. This avoids
+quadratic destination cursor-byte work during large first imports/reconciliations.
+The 1,000-session test checks one large pending read, bounded control bytes per
+session, successful canonical history and no fake control session.
+
+Focused provider/indexer/service/watcher suites: 87 passed; root/app typecheck:
+zero errors. Final full verification and the independent followup reports are
+recorded in the delivery section below.
