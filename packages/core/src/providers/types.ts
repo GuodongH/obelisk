@@ -46,12 +46,17 @@ export interface IndexUnit {
    * Used when source observation/pending work must be durable before replacement.
    * A prerequisite is observed state, not proof that its dependent units finished. */
   requiresCursors?: readonly { key: string; cursor: string }[];
+  /** Provider-scoped publication set. Every planned unit with this key commits
+   * together; the adapter must withhold the set if discovery cannot supply it. */
+  atomicGroup?: string;
 }
 
 /** Read-only source provenance exposed to one provider during discovery. */
 export interface IndexedSession {
   sessionId: string;
   jsonlPath: string;
+  /** Canonical subagent identities previously owned by this session. */
+  memberSessionIds?: readonly string[];
 }
 
 /** One source location that prevented a provider from certifying its inventory. */
@@ -62,14 +67,31 @@ export interface InventoryIssue {
 
 /** Context the orchestration provides to discovery. */
 export interface DiscoverContext {
+  /** Require a complete projection: an unstable unit must fail, not return a no-op. */
+  snapshotRequired?: boolean;
   /** Look up the cursor persisted for a unit key on a previous run. */
   lastCursor(key: string): Cursor;
   /** When set (daemon changed-path mode), restrict discovery to these paths. */
   changedPaths?: string[];
   /** Sessions already indexed for this provider, keyed by their canonical source path. */
   indexedSessions?(): readonly IndexedSession[];
+  /** Historical checkpoint for identity/membership evidence, even during replay.
+   * Unlike lastCursor, this must never be used to skip or resume projection. */
+  previousCursor?(key: string): Cursor;
+  /** Keep this indexed canonical session unchanged when it cannot be rebuilt. */
+  retainSession?(sessionId: string): void;
   /** Report that the source inventory could not be enumerated completely. */
   reportIncompleteInventory?(issue?: InventoryIssue): void;
+  /**
+   * Report an artifact whose identity is known but whose content this adapter
+   * version cannot project (for example a session file carrying a format
+   * version newer than the adapter supports).
+   *
+   * This records diagnostics without withholding unrelated publication. The
+   * adapter must also retainSession for affected indexed trees and withhold
+   * their projection/retraction; a diagnostic alone never protects old rows.
+   */
+  reportSkippedArtifact?(issue?: InventoryIssue): void;
 }
 
 /** Canonical language emitted by every provider adapter. Persist serializes it;

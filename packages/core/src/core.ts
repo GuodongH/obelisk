@@ -45,27 +45,30 @@ interface InvocationOptions {
   invocationNonce?: string | readonly (string | { value: string; strict?: boolean })[];
 }
 
-interface InventoryIssue {
+interface IndexIssue {
   provider?: unknown;
   path?: unknown;
   error?: unknown;
 }
 
-function reportIncompleteInventory(build: unknown): void {
-  if (build === null || typeof build !== 'object' || !('inventoryIssues' in build)) return;
-  const issues = (build as { inventoryIssues?: unknown }).inventoryIssues;
-  if (!Array.isArray(issues)) return;
-  for (const value of issues) {
-    const issue = value as InventoryIssue | null;
-    if (
-      issue !== null
-      && typeof issue.provider === 'string'
-      && typeof issue.path === 'string'
-      && typeof issue.error === 'string'
-    ) {
-      process.stderr.write(
-        `Warning: incomplete ${issue.provider} source inventory at ${issue.path}: ${issue.error}\n`,
-      );
+function reportIndexIssues(build: unknown): void {
+  if (build === null || typeof build !== 'object') return;
+  const result = build as { inventoryIssues?: unknown; skippedFiles?: unknown };
+  for (const kind of ['inventoryIssues', 'skippedFiles'] as const) {
+    const issues = result[kind];
+    if (!Array.isArray(issues)) continue;
+    for (const value of issues) {
+      if (value === null || typeof value !== 'object') continue;
+      const issue = value as IndexIssue;
+      if (
+        typeof issue.provider === 'string'
+        && typeof issue.path === 'string'
+        && typeof issue.error === 'string'
+      ) {
+        process.stderr.write(kind === 'inventoryIssues'
+          ? `Warning: incomplete ${issue.provider} source inventory at ${issue.path}: ${issue.error}\n`
+          : `Warning: skipped ${issue.provider} artifact ${issue.path}: ${issue.error}\n`);
+      }
     }
   }
 }
@@ -89,7 +92,7 @@ function refreshQueryIndex(): ProviderRegistry {
   // it is their reconciliation: there is no watcher to reconcile against.
   // It therefore verifies prefixes (strict) instead of trusting cooperative
   // append checkpoints (RFC #172).
-  reportIncompleteInventory(buildIndex({ providerRegistry, readMode: 'strict' }));
+  reportIndexIssues(buildIndex({ providerRegistry, readMode: 'strict' }));
   return providerRegistry;
 }
 
@@ -375,7 +378,7 @@ export function resolveInvokingSessionIdWithWait(
   const immediate = tryResolve();
   if (immediate) return immediate;
   if (schemaReady()) {
-    reportIncompleteInventory(build());
+    reportIndexIssues(build());
     const afterBuild = tryResolve();
     if (afterBuild) return afterBuild;
   }

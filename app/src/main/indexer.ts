@@ -7,6 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
+import { prepareRetainedSnapshot } from '../../../packages/core/src/snapshot.ts';
 import { createBuiltinProviderRegistry } from '../../../packages/core/src/providers/builtins.ts';
 import {
   backfillUnresolvedSessionProjectPathsOnce,
@@ -27,9 +28,12 @@ import {
   indexProviderPlanStrict,
   ProviderIndexFailure,
   readRecentTranscriptHints,
+  readProviderIndexState,
+  readProviderSessionProvenance,
   writeProviderIndexMarkers,
   type ProviderInventoryIssue,
   type ProviderSessionProvenance,
+  type StoredProviderState,
 } from '../../../packages/core/src/provider-indexing.ts';
 import { runWriteTransaction, configureConnection, betterSqliteTransactionAdapter } from '../../../packages/core/src/tx.ts';
 import { migrateCoreSchemaColumns } from '../../../packages/core/src/schema-migrations.ts';
@@ -67,7 +71,7 @@ function openIndexDb({ dbPath = DEFAULT_DB_PATH, schemaPath = resolveSchemaPath(
   return db;
 }
 
-function copyPreservedDataFromDb(db, sourceDbPath): ProviderSessionProvenance[] {
+function copyPreservedDataFromDb(db, sourceDbPath): { sessions: ProviderSessionProvenance[]; indexState: ReadonlyMap<string, StoredProviderState> } {
   if (!sourceDbPath || !fs.existsSync(sourceDbPath)) {
     throw new Error(`Preserved Obelisk database is unavailable: ${sourceDbPath}`);
   }
@@ -116,19 +120,8 @@ function copyPreservedDataFromDb(db, sourceDbPath): ProviderSessionProvenance[] 
     if (!sessionColumns.has('id') || !sessionColumns.has('jsonl_path')) {
       throw new Error(`Preserved Obelisk sessions schema is incomplete: ${sourceDbPath}`);
     }
-    const sourceExpression = sessionColumns.has('source')
-      ? "COALESCE(source, 'claude')"
-      : "'claude'";
-    return db.prepare(`
-      SELECT id, jsonl_path, ${sourceExpression} AS source
-      FROM previous_obelisk.sessions
-      WHERE jsonl_path IS NOT NULL
-        AND jsonl_path != ''
-    `).all().map(row => ({
-      source: String(row.source),
-      sessionId: String(row.id),
-      jsonlPath: String(row.jsonl_path),
-    }));
+    const sessions = readProviderSessionProvenance(db, 'previous_obelisk');
+    return { sessions, indexState: readProviderIndexState(db, 'previous_obelisk') };
   } finally {
     db.exec('DETACH DATABASE previous_obelisk');
   }
@@ -300,8 +293,11 @@ function buildIndex({
     let messageFtsTriggersDropped = false;
     try {
       let priorSessions: ProviderSessionProvenance[] | undefined;
+      let priorIndexState: ReadonlyMap<string, StoredProviderState> | undefined;
       if (preserveDbPath && path.resolve(preserveDbPath) !== path.resolve(dbPath)) {
-        priorSessions = copyPreservedDataFromDb(db, preserveDbPath);
+        const previous = copyPreservedDataFromDb(db, preserveDbPath);
+        priorSessions = previous.sessions;
+        priorIndexState = previous.indexState;
       }
       const defaultHome = os.homedir();
       const compatibilityHome = path.dirname(claudeDir);
@@ -359,6 +355,7 @@ function buildIndex({
         force,
         changedPaths,
         priorSessions,
+        priorIndexState,
         readMode,
       });
       let latestSourceMtime = providerPlan.items.reduce((latest, { unit }) => {
@@ -375,14 +372,15 @@ function buildIndex({
       const discoveredSourceMtime = latestSourceMtime;
       const incompleteProviders = [...providerPlan.incompleteProviders].sort();
       const inventoryIssues = [...providerPlan.inventoryIssues];
+      const skipped: SkippedFile[] = [...providerPlan.skippedArtifacts];
       if (force && incompleteProviders.length > 0) {
         return {
           files: providerPlan.items.length,
           latestSourceMtime,
           affectedSessionIds: [],
           ftsRebuilt: false,
-          skipped: 0,
-          skippedFiles: [],
+          skipped: skipped.length,
+          skippedFiles: skipped,
           deferred: false,
           complete: false,
           incompleteProviders,
@@ -407,7 +405,6 @@ function buildIndex({
           }
         }
       }
-      const skipped: SkippedFile[] = [];
       let ftsRebuilt = false;
       const noteCommitted = ({ unit }, nextCursor) => {
         if (nextCursor) {
@@ -440,20 +437,21 @@ function buildIndex({
       };
 
       if (force) {
+        const previousDb = providerPlan.retainedSessions.length > 0 && preserveDbPath && path.resolve(preserveDbPath) !== path.resolve(dbPath)
+          ? new (DatabaseImpl as new (file: string, options: { readonly: boolean; fileMustExist: boolean }) => any)(preserveDbPath, { readonly: true, fileMustExist: true })
+          : undefined;
+        let snapshot: ReturnType<typeof prepareRetainedSnapshot> | undefined;
         try {
+          snapshot = prepareRetainedSnapshot(db, providerPlan.retainedSessions, previousDb);
+          const retainedSnapshot = snapshot;
           runRetryableWriteTransaction(txDb, () => {
             latestSourceMtime = discoveredSourceMtime;
             affectedSessionIds.clear();
-            skipped.splice(0);
+            skipped.splice(0, skipped.length, ...providerPlan.skippedArtifacts);
             ftsRebuilt = false;
             dropMessageFtsTriggers(db);
             messageFtsTriggersDropped = true;
-            // The provider contract reserves no key prefix. A force snapshot
-            // recreates every unit cursor, provider marker, and system marker.
-            db.prepare('DELETE FROM index_state').run();
-            for (const table of ['messages', 'tool_calls', 'tool_results', 'sessions', 'summaries', 'subagents', 'workflows', 'workflow_agents']) {
-              db.prepare(`DELETE FROM ${table}`).run();
-            }
+            retainedSnapshot.reset();
             const providerResult = indexProviderPlanStrict({
               db,
               plan: providerPlan,
@@ -468,6 +466,8 @@ function buildIndex({
               latestSourceMtime: discoveredSourceMtime,
               incompleteProviders,
               inventoryIssues,
+              skipped: skipped.length,
+              skippedFiles: skipped,
             });
           }
           if (error instanceof ProviderIndexFailure) {
@@ -500,6 +500,9 @@ function buildIndex({
             };
           }
           throw error;
+        } finally {
+          try { snapshot?.close(); }
+          finally { previousDb?.close(); }
         }
         for (const sessionId of finalizeAffectedSessionIds) affectedSessionIds.add(sessionId);
         return {
@@ -507,8 +510,8 @@ function buildIndex({
           latestSourceMtime,
           affectedSessionIds: [...affectedSessionIds],
           ftsRebuilt,
-          skipped: 0,
-          skippedFiles: [],
+          skipped: skipped.length,
+          skippedFiles: skipped,
           deferred: false,
           complete: true,
           incompleteProviders,

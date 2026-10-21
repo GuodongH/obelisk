@@ -239,3 +239,54 @@ roots, persisted source roots, source catalog/UI labels and colors, and
 raw-record routing. Adding Pi therefore adds no Pi-specific branch to the
 shared schema, persist layer, indexers, settings, query API, or renderer; the
 provenance and summary-usage additions are provider-neutral contracts.
+
+
+**Amendment (2026-10-20): retain known unprojectable sessions.** Discovery
+reports an unsupported, identified artifact separately from a failed inventory.
+It also explicitly retains affected canonical session identities. The shared
+index plan excludes declared replacements and retractions targeting retained identities;
+a diagnostic by itself is not a preservation instruction. Providers must close
+retention over their current and historical atomic ownership (DeepSeek root
+session trees), including members that moved between trees.
+
+Force publication combines the readable projection with these last-good
+canonical session closures. `snapshot.ts` stages and restores the same tables
+for an in-place core rebuild and a desktop replacement database. The latter
+supplies a separate read-only source connection; bounded row/keyset copies use
+only the common SQLite statement interface, not binding-specific URI options.
+Staging occurs
+under the writer lease; cleanup, restore, projection, FTS and marker publication
+remain one retryable transaction. A source whose identity/inventory cannot be
+certified still withholds force publication. Known unsupported sessions permit
+unrelated publication, but are always returned in `skippedFiles`.
+
+`index_state.replay_required` is additive control state, defaulting to zero for
+existing checkpoints. A scheduled replay invalidates a checkpoint for projection
+without deleting its historical membership evidence. `previousCursor` exposes
+that evidence to discovery even during force or marker replay; `lastCursor`
+returns null while replay is pending. A retained snapshot restores its checkpoint
+with replay required, never as newly indexed data. Successful persist replaces
+the state and clears the flag. Provider markers still record a scheduled replay,
+so healthy units converge independently while retained units remain pending.
+The DeepSeek v5 canonical marker schedules one repair replay of readable trees
+that older discovery could have published without a child. No transcript UUID,
+record shape, or adapter cursor encoding changes.
+
+**Amendment (2026-10-20): connected publication transactions.** A provider may
+set `IndexUnit.atomicGroup` to connect multiple units whose ownership changes
+must publish together. The key is opaque and provider-scoped. Shared indexing
+commits each group, including retractions, canonical writes, project-path
+updates and cursors, in one retryable transaction. A failed group rolls back
+every member and schedules replay for the whole group; unrelated units may
+still progress. Successful notifications run only after the group commits.
+Retaining one planned member also retains the group's replacement identities.
+
+Discovery must include every participating owner, even an unchanged owner, and
+withhold the complete group when any owner is known unavailable. An unstable
+parse in such a group must throw rather than return a successful no-op.
+Canonical subagent ownership is exposed as optional `IndexedSession.memberSessionIds`
+alongside source provenance, so providers can recover historical ownership when
+a checkpoint is missing or belongs to a different identity. Shared code neither
+decodes provider cursors nor interprets ancestry. Providers without groups keep
+their existing per-unit publication behavior; force remains a single snapshot
+transaction across all units.

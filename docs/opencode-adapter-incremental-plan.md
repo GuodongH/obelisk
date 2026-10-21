@@ -279,3 +279,16 @@ Node 22.13.0 still fails CLI startup at the pre-existing DSH zstd import, reprod
 on base in the earlier review and again in the final packed CLI; this work verifies
 Node 22.23.3 and does not repair or expand the declared runtime floor. Current main
 was not merged; final verification applies to this PR's code and the recorded base.
+
+### Merge preparation against current main
+
+Main advanced to `63b041e3cf9e613d7e00ea6eb5b1734a7785d1d4` (#238/#239).
+The merge preserves both the DeepSeek atomic publication/retention/replay-required
+contract and OpenCode's recordless-control/prerequisite contract. Prerequisites
+are checked per item inside the existing atomic batch transaction. Only a batch
+containing transcript units schedules canonical replay; source-control cursors
+remain ready for dependent units. CI and app-provider tests retain both additions.
+
+Earlier no-main-merge statements and validation totals above describe historical
+pre-merge heads. Verification is rerun for this integration; current totals and
+merge evidence are recorded in the PR description and session merge report.
