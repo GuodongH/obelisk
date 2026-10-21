@@ -1938,7 +1938,9 @@ test('review regression: hundreds of newer sessions in one channel do not hide a
   } finally { first.db.close(); second.db.close(); idx.close(); }
 });
 
-test('delimiter-bearing paths authenticate raw lookup and reject restored tombstones', () => {
+test('delimiter-bearing paths authenticate raw lookup and reject restored tombstones', {
+  skip: process.platform === 'win32' ? 'Windows filenames cannot contain a colon; virtual-path raw authentication is covered separately' : false,
+}, () => {
   const dir = join(makeTempDir('opencode-identity-'), 'data#ses:archive');
   mkdirSync(dir);
   const source = upstreamStore('v2.0.32', 'opencode.db', dir);
@@ -1963,6 +1965,31 @@ test('delimiter-bearing paths authenticate raw lookup and reject restored tombst
     assert.equal(idx.db.prepare('SELECT count(*) n FROM messages').get().n, 1);
     assert.deepEqual(source.provider.watchHints(session.jsonl_path), [source.path, `${source.path}-wal`]);
   } finally { source.db.close(); idx.close(); }
+});
+
+test('raw authenticates delimiter-bearing virtual store identities on every platform', () => {
+  const source = upstreamStore('v2.0.32');
+  const nativeId = 's:#ses:%';
+  upstreamSession(source.db, nativeId, 'session_v2');
+  upstreamMessage(source.db, nativeId, 'm', 'user', 1, { text: 'synthetic identity' });
+  try {
+    const unit = discover(source.provider)[0];
+    const message = [...source.provider.parse(unit, null)].find(record => record.kind === 'message');
+    const virtualPath = join(source.dir, 'data#ses:archive', 'opencode.db');
+    const session = { id: opencodeSessionId(nativeId, virtualPath), jsonl_path: opencodeUnitKey(virtualPath, nativeId) };
+    const messageUuid = session.id + message.uuid.slice(unit.sessionId.length);
+    let opens = 0;
+    const provider = createOpencodeProvider({ rootDir: source.dir, openDatabase: path => {
+      assert.equal(path, virtualPath);
+      opens++;
+      return openDb(source.path);
+    } });
+    assert.equal(provider.raw({ source: 'opencode', session, messageUuid }).messageText, 'synthetic identity');
+    assert.equal(opens, 1);
+    assert.equal(provider.raw({ source: 'opencode', session: { ...session, id: unit.sessionId }, messageUuid }), null);
+    assert.equal(provider.raw({ source: 'opencode', session, messageUuid: message.uuid }), null);
+    assert.equal(opens, 1, 'mismatched store identities must be rejected before opening a database');
+  } finally { source.db.close(); }
 });
 
 test('damaged required legacy tool fields preserve last-good tools and cursor until recovery', () => {
